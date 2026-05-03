@@ -1,0 +1,66 @@
+__use_yte__: true
+
+__definitions__:
+  - from datetime import datetime
+  - import os
+  - current_time = datetime.now()
+
+run_output: ?"runs/" + current_time.strftime("%Y-%m-%d_%H-%M-%S")
+
+sources:
+  libc-bench: 
+    files:
+    - "main.c"
+    - "malloc.c"
+    - "regex.c"
+    - "stdio.c"
+    - "string.c"
+    - "utf8.c"
+
+revocation_options:
+  - "none"
+  - "uninit"
+reserve_stack_options:
+  - "none"
+  - "reserve"
+encapsulation_options:
+  - "none"
+  - "trampoline"
+  - "isentry"
+clear_options:
+  - "noclear"
+  - "clear"
+reducecsr_options:
+  - "noreduce"
+  - "reduce"
+
+
+stack_sizes:
+  # - "16K"
+  - "8M"
+
+baseline_stack_size: "8M"
+uninitreserve_stack_size: "8M"
+
+benchmarks:
+  - "coremark"
+  - "libc-bench"
+  - "random-callstack-ubench"
+
+libc-bench_parts:
+  - "malloc"
+  - "string"
+  # - "utf8"
+  # - "stdio"
+  - "regex"
+
+random-callstack-ubench_secure_ratios: 
+  - "0.1"
+  - "0.5"
+  - "0.9"
+
+gem5: 
+  executable: "<path_to>/gem5/build/RISCV/gem5.opt"
+  script: "<path_to>/gem5/configs/example/etrace_replay.py"
+  script_default_args:
+    - "--mem-size=8GB"

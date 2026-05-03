@@ -1,0 +1,8 @@
+builds
+logs
+runs
+run_backups
+.snakemake
+sysroots/*
+!sysroots/sysroots.smk
+!sysroots/scripts

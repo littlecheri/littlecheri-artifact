@@ -1,0 +1,3075 @@
+diff --git a/clang/include/clang-c/Index.h b/clang/include/clang-c/Index.h
+index 271de31c65f1..d5f64e826ff6 100644
+--- a/clang/include/clang-c/Index.h
++++ b/clang/include/clang-c/Index.h
+@@ -3485,6 +3485,7 @@ enum CXCallingConv {
+   CXCallingConv_CHERICCall = 80,
+   CXCallingConv_CHERICCallee = 81,
+   CXCallingConv_CHERICCallback = 82,
++  CXCallingConv_CHERIUninit = 83,
+ 
+   CXCallingConv_Invalid = 100,
+   CXCallingConv_Unexposed = 200
+diff --git a/clang/include/clang/Basic/Attr.td b/clang/include/clang/Basic/Attr.td
+index 431a20c7ac99..05239632a17e 100644
+--- a/clang/include/clang/Basic/Attr.td
++++ b/clang/include/clang/Basic/Attr.td
+@@ -2356,6 +2356,12 @@ def CHERICCallback : DeclOrTypeAttr { // InheritableAttr {
+   let Documentation = [Undocumented];
+ }
+ 
++def CHERIUninit : DeclOrTypeAttr { // InheritableAttr {
++  let Spellings = [GNU<"cheri_uninit">];
++  let Subjects = SubjectList<[Function]>;
++  let Documentation = [CHERIUninitDocs];
++}
++
+ def CHERIMethodSuffix : DeclOrTypeAttr { // InheritableAttr {
+   let Spellings = [GNU<"cheri_method_suffix">];
+   let Documentation = [Undocumented];
+diff --git a/clang/include/clang/Basic/AttrDocs.td b/clang/include/clang/Basic/AttrDocs.td
+index 5c84e2fc5b77..d2eed83688a1 100644
+--- a/clang/include/clang/Basic/AttrDocs.td
++++ b/clang/include/clang/Basic/AttrDocs.td
+@@ -6633,7 +6633,18 @@ The values ``thunk`` and ``thunk-inline`` from GCC are not supported.
+ 
+ The symbol used for ``thunk-extern`` is target specific:
+ * X86: ``__x86_return_thunk``
+-
+ As such, this function attribute is currently only supported on X86 targets.
+   }];
+ }
++
++
++def CHERIUninitDocs : Documentation {
++  let Category = DocCatCallingConvs;
++  let Content = [{
++  Calling convention available on CHERI PureCap targets. Makes use of uninitialized
++  capabilities to enforce local state encapsulation and well-bracketed control flow.
++  Assigning the ``cheri_uninit`` attribute to a function will make any call to that
++  function use the uninitialized capability calling convention.
++  See https://dl.acm.org/doi/pdf/10.1145/3434287
++  }];
++}
+diff --git a/clang/include/clang/Basic/Specifiers.h b/clang/include/clang/Basic/Specifiers.h
+index 81d3deda22d7..7b2f3c71549e 100644
+--- a/clang/include/clang/Basic/Specifiers.h
++++ b/clang/include/clang/Basic/Specifiers.h
+@@ -276,6 +276,7 @@ namespace clang {
+     CC_CHERICCall,  // __attribute__((cheri_ccall))
+     CC_CHERICCallee,// __attribute__((cheri_ccallee))
+     CC_CHERICCallback,// __attribute__((cheri_ccallback))
++    CC_CHERIUninit, // __attribute__((cheri_uninit))
+     CC_IntelOclBicc, // __attribute__((intel_ocl_bicc))
+     CC_SpirFunction, // default for OpenCL functions on SPIR target
+     CC_OpenCLKernel, // inferred for OpenCL kernels
+@@ -302,6 +303,7 @@ namespace clang {
+     case CC_OpenCLKernel:
+     case CC_Swift:
+     case CC_SwiftAsync:
++    case CC_CHERIUninit:
+       return false;
+     default:
+       return true;
+diff --git a/clang/lib/AST/ItaniumMangle.cpp b/clang/lib/AST/ItaniumMangle.cpp
+index fea772927c3e..c8b76d36b77e 100644
+--- a/clang/lib/AST/ItaniumMangle.cpp
++++ b/clang/lib/AST/ItaniumMangle.cpp
+@@ -3178,6 +3178,7 @@ StringRef CXXNameMangler::getCallingConvQualifierName(CallingConv CC) {
+   case CC_CHERICCall:
+   case CC_CHERICCallee:
+   case CC_CHERICCallback:
++  case CC_CHERIUninit:
+     // FIXME: we should be mangling all of the above.
+     return "";
+ 
+diff --git a/clang/lib/AST/Type.cpp b/clang/lib/AST/Type.cpp
+index 65463faf6ae5..c60307c52ed6 100644
+--- a/clang/lib/AST/Type.cpp
++++ b/clang/lib/AST/Type.cpp
+@@ -3300,6 +3300,7 @@ StringRef FunctionType::getNameForCallConv(CallingConv CC) {
+   case CC_CHERICCall: return "cheri_ccall";
+   case CC_CHERICCallee: return "cheri_ccallee";
+   case CC_CHERICCallback: return "attr_cheri_ccallback";
++  case CC_CHERIUninit: return "cheri_uninit";
+   case CC_X86StdCall: return "stdcall";
+   case CC_X86FastCall: return "fastcall";
+   case CC_X86ThisCall: return "thiscall";
+@@ -3751,6 +3752,7 @@ bool AttributedType::isCallingConv() const {
+   case attr::CHERICCall:
+   case attr::CHERICCallback:
+   case attr::CHERICCallee:
++  case attr::CHERIUninit:
+   case attr::FastCall:
+   case attr::StdCall:
+   case attr::ThisCall:
+diff --git a/clang/lib/AST/TypePrinter.cpp b/clang/lib/AST/TypePrinter.cpp
+index 0f3053d9732e..a8b3a0dc7475 100644
+--- a/clang/lib/AST/TypePrinter.cpp
++++ b/clang/lib/AST/TypePrinter.cpp
+@@ -1035,6 +1035,9 @@ void TypePrinter::printFunctionAfter(const FunctionType::ExtInfo &Info,
+     case CC_CHERICCallee:
+       OS << " __attribute__((cheri_ccallee))";
+       break;
++    case CC_CHERIUninit:
++      OS << " __attribute__((cheri_uninit))";
++      break;
+     case CC_X86RegCall:
+       OS << " __attribute__((regcall))";
+       break;
+@@ -1827,6 +1830,7 @@ void TypePrinter::printAttributedAfter(const AttributedType *T,
+   case attr::CHERICCall: OS << "cheri_ccall"; break;
+   case attr::CHERICCallback: OS << "cheri_ccallback"; break;
+   case attr::CHERICCallee: OS << "cheri_ccallee"; break;
++  case attr::CHERIUninit: OS << "cheri_uninit"; break;
+   case attr::FastCall: OS << "fastcall"; break;
+   case attr::StdCall: OS << "stdcall"; break;
+   case attr::ThisCall: OS << "thiscall"; break;
+diff --git a/clang/lib/Basic/Targets/RISCV.h b/clang/lib/Basic/Targets/RISCV.h
+index a7c2b456b104..119034d0caa1 100644
+--- a/clang/lib/Basic/Targets/RISCV.h
++++ b/clang/lib/Basic/Targets/RISCV.h
+@@ -36,7 +36,8 @@ class RISCVTargetInfo : public TargetInfo {
+       else
+         Layout = "e-m:e-p:32:32-i64:64-n32-S128";
+     } else if (ABI == "lp64" || ABI == "lp64f" || ABI == "lp64d" ||
+-               ABI == "l64pc128" || ABI == "l64pc128f" || ABI == "l64pc128d") {
++               ABI == "l64pc128" || ABI == "l64pc128f" || ABI == "l64pc128d" ||
++               ABI == "l64pcu128") {
+       if (HasCheri)
+         Layout = "e-m:e-pf200:128:128:128:64-p:64:64-i64:64-i128:128-n64-S128";
+       else
+@@ -209,7 +210,8 @@ public:
+       ABI = Name;
+       return true;
+     }
+-    if (Name == "l64pc128" || Name == "l64pc128f" || Name == "l64pc128d") {
++    if (Name == "l64pc128" || Name == "l64pc128f" || Name == "l64pc128d" ||
++        Name == "l64pcu128") {
+       setCapabilityABITypes();
+       CapabilityABI = true;
+       ABI = Name;
+@@ -231,6 +233,17 @@ public:
+   }
+ 
+   uint64_t getPointerRangeForCHERICapability() const override { return 64; }
++
++  CallingConvCheckResult checkCallingConvention(CallingConv CC) const override {
++    switch (CC) {
++    case CC_C:
++    case CC_CHERICCall:
++    case CC_CHERIUninit:
++      return CCCR_OK;
++    default:
++      return CCCR_Warning;
++    }
++  }
+ };
+ } // namespace targets
+ } // namespace clang
+diff --git a/clang/lib/CodeGen/CGCall.cpp b/clang/lib/CodeGen/CGCall.cpp
+index a474976703ba..428605ea13fe 100644
+--- a/clang/lib/CodeGen/CGCall.cpp
++++ b/clang/lib/CodeGen/CGCall.cpp
+@@ -52,6 +52,7 @@ unsigned CodeGenTypes::ClangCallConvToLLVMCallConv(CallingConv CC) {
+   case CC_CHERICCallback:
+     return llvm::CallingConv::CHERI_CCall;
+   case CC_CHERICCallee: return llvm::CallingConv::CHERI_CCallee;
++  case CC_CHERIUninit: return llvm::CallingConv::CHERI_Uninit;
+   case CC_X86StdCall: return llvm::CallingConv::X86_StdCall;
+   case CC_X86FastCall: return llvm::CallingConv::X86_FastCall;
+   case CC_X86RegCall: return llvm::CallingConv::X86_RegCall;
+@@ -237,6 +238,9 @@ static CallingConv getCallingConventionForDecl(const ObjCMethodDecl *D,
+   if (D->hasAttr<CHERICCallbackAttr>())
+     return CC_CHERICCallback;
+ 
++  if (D->hasAttr<CHERIUninitAttr>())
++    return CC_CHERIUninit;
++
+   if (D->hasAttr<AArch64VectorPcsAttr>())
+     return CC_AArch64VectorCall;
+ 
+diff --git a/clang/lib/CodeGen/CGDebugInfo.cpp b/clang/lib/CodeGen/CGDebugInfo.cpp
+index 4d5219312223..4fd3365a08bc 100644
+--- a/clang/lib/CodeGen/CGDebugInfo.cpp
++++ b/clang/lib/CodeGen/CGDebugInfo.cpp
+@@ -1357,6 +1357,7 @@ static unsigned getDwarfCC(CallingConv CC) {
+   case CC_CHERICCall:
+   case CC_CHERICCallee:
+   case CC_CHERICCallback:
++  case CC_CHERIUninit:
+     return 0;
+   case CC_X86RegCall:
+     return llvm::dwarf::DW_CC_LLVM_X86RegCall;
+diff --git a/clang/lib/Driver/ToolChains/Arch/RISCV.cpp b/clang/lib/Driver/ToolChains/Arch/RISCV.cpp
+index 3295cf2cc277..2cd21f8c468c 100644
+--- a/clang/lib/Driver/ToolChains/Arch/RISCV.cpp
++++ b/clang/lib/Driver/ToolChains/Arch/RISCV.cpp
+@@ -57,6 +57,7 @@ static bool isCheriPurecapABIName(StringRef ABI) {
+       .Case("l64pc128", true)
+       .Case("l64pc128f", true)
+       .Case("l64pc128d", true)
++      .Case("l64pcu128", true)
+       .Default(false);
+ }
+ 
+diff --git a/clang/lib/Sema/SemaDeclAttr.cpp b/clang/lib/Sema/SemaDeclAttr.cpp
+index 9a4a5c1bff77..d7492687eea4 100644
+--- a/clang/lib/Sema/SemaDeclAttr.cpp
++++ b/clang/lib/Sema/SemaDeclAttr.cpp
+@@ -5126,6 +5126,9 @@ static void handleCallConvAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
+   case ParsedAttr::AT_CHERICCallback:
+     D->addAttr(::new (S.Context) CHERICCallbackAttr(S.Context, AL));
+     return;
++  case ParsedAttr::AT_CHERIUninit:
++    D->addAttr(::new (S.Context) CHERIUninitAttr(S.Context, AL));
++    return;
+   case ParsedAttr::AT_AArch64VectorPcs:
+     D->addAttr(::new (S.Context) AArch64VectorPcsAttr(S.Context, AL));
+     return;
+@@ -5336,6 +5339,9 @@ bool Sema::CheckCallingConvAttr(const ParsedAttr &Attrs, CallingConv &CC,
+   case ParsedAttr::AT_CHERICCallback:
+     CC = CC_CHERICCallback;
+     break;
++  case ParsedAttr::AT_CHERIUninit:
++    CC = CC_CHERIUninit;
++    break;
+   case ParsedAttr::AT_IntelOclBicc:
+     CC = CC_IntelOclBicc;
+     break;
+@@ -9020,6 +9026,7 @@ ProcessDeclAttribute(Sema &S, Scope *scope, Decl *D, const ParsedAttr &AL,
+   case ParsedAttr::AT_CHERICCall:
+   case ParsedAttr::AT_CHERICCallee:
+   case ParsedAttr::AT_CHERICCallback:
++  case ParsedAttr::AT_CHERIUninit:
+   case ParsedAttr::AT_FastCall:
+   case ParsedAttr::AT_ThisCall:
+   case ParsedAttr::AT_Pascal:
+diff --git a/clang/lib/Sema/SemaType.cpp b/clang/lib/Sema/SemaType.cpp
+index 33248468b778..67e8d2daa6f4 100644
+--- a/clang/lib/Sema/SemaType.cpp
++++ b/clang/lib/Sema/SemaType.cpp
+@@ -116,6 +116,7 @@ static void diagnoseBadTypeAttribute(Sema &S, const ParsedAttr &attr,
+   case ParsedAttr::AT_CHERICCall:                                              \
+   case ParsedAttr::AT_CHERICCallee:                                            \
+   case ParsedAttr::AT_CHERICCallback:                                          \
++  case ParsedAttr::AT_CHERIUninit:                                             \
+   case ParsedAttr::AT_FastCall:                                                \
+   case ParsedAttr::AT_StdCall:                                                 \
+   case ParsedAttr::AT_ThisCall:                                                \
+@@ -7639,6 +7640,8 @@ static Attr *getCCTypeAttr(ASTContext &Ctx, ParsedAttr &Attr) {
+     return createSimpleAttr<CHERICCalleeAttr>(Ctx, Attr);
+   case ParsedAttr::AT_CHERICCallback:
+     return createSimpleAttr<CHERICCallAttr>(Ctx, Attr);
++  case ParsedAttr::AT_CHERIUninit:
++    return createSimpleAttr<CHERIUninitAttr>(Ctx, Attr);
+   case ParsedAttr::AT_IntelOclBicc:
+     return createSimpleAttr<IntelOclBiccAttr>(Ctx, Attr);
+   case ParsedAttr::AT_MSABI:
+diff --git a/clang/tools/libclang/CXType.cpp b/clang/tools/libclang/CXType.cpp
+index 750de97a64bf..bf29c75bb1cd 100644
+--- a/clang/tools/libclang/CXType.cpp
++++ b/clang/tools/libclang/CXType.cpp
+@@ -662,6 +662,7 @@ CXCallingConv clang_getFunctionTypeCallingConv(CXType X) {
+       TCALLINGCONV(CHERICCall);
+       TCALLINGCONV(CHERICCallback);
+       TCALLINGCONV(CHERICCallee);
++      TCALLINGCONV(CHERIUninit);
+       TCALLINGCONV(X86StdCall);
+       TCALLINGCONV(X86FastCall);
+       TCALLINGCONV(X86ThisCall);
+diff --git a/llvm/include/llvm/ADT/SmallVector.h b/llvm/include/llvm/ADT/SmallVector.h
+index 44229e2a3c2b..680c59c3d864 100644
+--- a/llvm/include/llvm/ADT/SmallVector.h
++++ b/llvm/include/llvm/ADT/SmallVector.h
+@@ -29,6 +29,7 @@
+ #include <new>
+ #include <type_traits>
+ #include <utility>
++#include <cstdint>
+ 
+ namespace llvm {
+ 
+diff --git a/llvm/include/llvm/AsmParser/LLToken.h b/llvm/include/llvm/AsmParser/LLToken.h
+index b87e200bc491..4c99c52b881b 100644
+--- a/llvm/include/llvm/AsmParser/LLToken.h
++++ b/llvm/include/llvm/AsmParser/LLToken.h
+@@ -150,6 +150,7 @@ enum Kind {
+   kw_spir_func,
+   kw_chericcallcc,
+   kw_chericcallcce,
++  kw_cheriuninitcc,
+   kw_x86_64_sysvcc,
+   kw_win64cc,
+   kw_webkit_jscc,
+diff --git a/llvm/include/llvm/IR/CallingConv.h b/llvm/include/llvm/IR/CallingConv.h
+index 77e203963962..42662966fa9f 100644
+--- a/llvm/include/llvm/IR/CallingConv.h
++++ b/llvm/include/llvm/IR/CallingConv.h
+@@ -260,6 +260,13 @@ namespace CallingConv {
+     /// argument, zeroes all unused return registers on return.
+     CHERI_CCallee = 103,
+ 
++    /// CHERI_Uninit - Calling convention leveraging uninitialized capabilities
++    /// as described in Georges, A. L., Guéneau, A., Van Strydonck, T., Timany,
++    /// A., Trieu, A., Huyghebaert, S., ... & Birkedal, L. (2021). Efficient and
++    /// provable local capability revocation using uninitialized capabilities.
++    /// Proc. ACM Program. Lang., 5(POPL), 1-30.
++    CHERI_Uninit = 104,
++
+     /// The highest possible calling convention ID. Must be some 2^k - 1.
+     MaxID = 1023
+   };
+diff --git a/llvm/include/llvm/IR/IntrinsicsCHERICap.td b/llvm/include/llvm/IR/IntrinsicsCHERICap.td
+index 192930be40ae..a11da79202c0 100644
+--- a/llvm/include/llvm/IR/IntrinsicsCHERICap.td
++++ b/llvm/include/llvm/IR/IntrinsicsCHERICap.td
+@@ -93,6 +93,10 @@ def int_cheri_cap_unseal  :
+    ClangBuiltin<"__builtin_cheri_seal_entry">,
+    Intrinsic<[llvm_cap_ty], [llvm_cap_ty],
+     [IntrNoMem, IntrWillReturn]>;
++// TODO: add builtin to clang for this intrinsic
++def int_cheri_cap_seal_indirect_pcc:
++  Intrinsic<[llvm_cap_ty], [llvm_cap_ty],
++    [IntrNoMem, IntrWillReturn]>;
+ 
+ def int_cheri_cap_perms_check :
+   Intrinsic<[], [llvm_cap_ty, llvm_anyint_ty],
+@@ -180,3 +184,6 @@ def int_cheri_bounded_stack_cap :
+   Intrinsic<[llvm_cap_ty], [llvm_cap_ty, llvm_anyint_ty], [IntrNoMem, IntrWillReturn]>;
+ def int_cheri_bounded_stack_cap_dynamic :
+   Intrinsic<[llvm_cap_ty], [llvm_cap_ty, llvm_anyint_ty], [IntrNoMem, IntrWillReturn]>;
++
++def int_cheri_shrink_cap :
++  Intrinsic<[llvm_cap_ty], [llvm_cap_ty, llvm_anyint_ty], [IntrNoMem, IntrWillReturn]>;
+\ No newline at end of file
+diff --git a/llvm/lib/AsmParser/LLLexer.cpp b/llvm/lib/AsmParser/LLLexer.cpp
+index 0528ffab99a1..dea0066cff2e 100644
+--- a/llvm/lib/AsmParser/LLLexer.cpp
++++ b/llvm/lib/AsmParser/LLLexer.cpp
+@@ -589,6 +589,7 @@ lltok::Kind LLLexer::LexIdentifier() {
+   KEYWORD(coldcc);
+   KEYWORD(chericcallcc);
+   KEYWORD(chericcallcce);
++  KEYWORD(cheriuninitcc);
+   KEYWORD(cfguard_checkcc);
+   KEYWORD(x86_stdcallcc);
+   KEYWORD(x86_fastcallcc);
+diff --git a/llvm/lib/AsmParser/LLParser.cpp b/llvm/lib/AsmParser/LLParser.cpp
+index b2f3e0f4fb25..032501b01c02 100644
+--- a/llvm/lib/AsmParser/LLParser.cpp
++++ b/llvm/lib/AsmParser/LLParser.cpp
+@@ -1935,6 +1935,7 @@ bool LLParser::parseOptionalCallingConv(unsigned &CC) {
+   case lltok::kw_coldcc:         CC = CallingConv::Cold; break;
+   case lltok::kw_chericcallcc:   CC = CallingConv::CHERI_CCall; break;
+   case lltok::kw_chericcallcce:  CC = CallingConv::CHERI_CCallee; break;
++  case lltok::kw_cheriuninitcc:  CC = CallingConv::CHERI_Uninit; break;
+   case lltok::kw_cfguard_checkcc: CC = CallingConv::CFGuard_Check; break;
+   case lltok::kw_x86_stdcallcc:  CC = CallingConv::X86_StdCall; break;
+   case lltok::kw_x86_fastcallcc: CC = CallingConv::X86_FastCall; break;
+diff --git a/llvm/lib/IR/AsmWriter.cpp b/llvm/lib/IR/AsmWriter.cpp
+index 18ed2c63f24a..0d315bb60037 100644
+--- a/llvm/lib/IR/AsmWriter.cpp
++++ b/llvm/lib/IR/AsmWriter.cpp
+@@ -323,6 +323,7 @@ static void PrintCallingConv(unsigned cc, raw_ostream &Out) {
+   case CallingConv::SPIR_KERNEL:   Out << "spir_kernel"; break;
+   case CallingConv::CHERI_CCall:   Out << "chericcallcc"; break;
+   case CallingConv::CHERI_CCallee: Out << "chericcallcce"; break;
++  case CallingConv::CHERI_Uninit:  Out << "cheriuninitcc"; break;
+   case CallingConv::Swift:         Out << "swiftcc"; break;
+   case CallingConv::SwiftTail:     Out << "swifttailcc"; break;
+   case CallingConv::X86_INTR:      Out << "x86_intrcc"; break;
+diff --git a/llvm/lib/Target/RISCV/AsmParser/RISCVAsmParser.cpp b/llvm/lib/Target/RISCV/AsmParser/RISCVAsmParser.cpp
+index 8f12b3aab51b..77fc869a68e1 100644
+--- a/llvm/lib/Target/RISCV/AsmParser/RISCVAsmParser.cpp
++++ b/llvm/lib/Target/RISCV/AsmParser/RISCVAsmParser.cpp
+@@ -793,6 +793,15 @@ public:
+     return IsConstantImm && isUInt<12>(Imm) && VK == RISCVMCExpr::VK_RISCV_None;
+   }
+ 
++  bool isUImm32() const {
++    if (!isImm())
++      return false;
++    RISCVMCExpr::VariantKind VK;
++    int64_t Imm;
++    bool IsConstantImm = evaluateConstantImm(getImm(), Imm, VK);
++    return IsConstantImm && isUInt<32>(Imm) && VK == RISCVMCExpr::VK_RISCV_None;
++  }
++
+   bool isSImm12() const {
+     RISCVMCExpr::VariantKind VK = RISCVMCExpr::VK_RISCV_None;
+     int64_t Imm;
+diff --git a/llvm/lib/Target/RISCV/CHERIUninitTrampoline.h b/llvm/lib/Target/RISCV/CHERIUninitTrampoline.h
+new file mode 100644
+index 000000000000..8f038d22fd82
+--- /dev/null
++++ b/llvm/lib/Target/RISCV/CHERIUninitTrampoline.h
+@@ -0,0 +1,13 @@
++#include "RISCVISelLowering.h"
++using namespace llvm;
++
++static SmallVector<uint64_t, 3> ActrecCodeFp = {
++  0xfd02a40f020002db,
++  0xfe02a08fff02a10f,
++  0x0000000000008067
++};
++
++static SmallVector<uint64_t, 3> ActrecCodeNoFp = {
++  0xff02a10f020002db,
++  0x00008067fe02a08f
++};
+diff --git a/llvm/lib/Target/RISCV/MCTargetDesc/RISCVBaseInfo.h b/llvm/lib/Target/RISCV/MCTargetDesc/RISCVBaseInfo.h
+index e0369f50972e..f65ad5293933 100644
+--- a/llvm/lib/Target/RISCV/MCTargetDesc/RISCVBaseInfo.h
++++ b/llvm/lib/Target/RISCV/MCTargetDesc/RISCVBaseInfo.h
+@@ -412,6 +412,7 @@ inline static bool isCheriPureCapABI(ABI TargetABI) {
+     llvm_unreachable("Improperly initialised target ABI");
+   }
+ }
++
+ // Returns the register holding shadow call stack pointer.
+ MCRegister getSCSPReg();
+ 
+diff --git a/llvm/lib/Target/RISCV/MCTargetDesc/RISCVMCCodeEmitter.cpp b/llvm/lib/Target/RISCV/MCTargetDesc/RISCVMCCodeEmitter.cpp
+index 9dc0ac668215..6ebb9ecd3689 100644
+--- a/llvm/lib/Target/RISCV/MCTargetDesc/RISCVMCCodeEmitter.cpp
++++ b/llvm/lib/Target/RISCV/MCTargetDesc/RISCVMCCodeEmitter.cpp
+@@ -143,6 +143,10 @@ void RISCVMCCodeEmitter::expandFunctionCall(const MCInst &MI, raw_ostream &OS,
+     Func = MI.getOperand(1);
+     Ra = MI.getOperand(0).getReg();
+     IsCap = true;
++  } else if (MI.getOpcode() == RISCV::PseudoCCALLCustomRA) {
++    Func = MI.getOperand(1);
++    Ra = MI.getOperand(0).getReg();
++    IsCap = true;
+   }
+   uint32_t Binary;
+ 
+@@ -160,7 +164,8 @@ void RISCVMCCodeEmitter::expandFunctionCall(const MCInst &MI, raw_ostream &OS,
+   if (MI.getOpcode() == RISCV::PseudoTAIL ||
+       MI.getOpcode() == RISCV::PseudoJump ||
+       MI.getOpcode() == RISCV::PseudoCTAIL ||
+-      MI.getOpcode() == RISCV::PseudoCJump)
++      MI.getOpcode() == RISCV::PseudoCJump ||
++      MI.getOpcode() == RISCV::PseudoCCALLCustomRA)
+     // Emit [C]JALR [XC]0, Ra, 0
+     TmpInst = MCInstBuilder(IsCap ? RISCV::CJALR : RISCV::JALR)
+                   .addReg(IsCap ? RISCV::C0 : RISCV::X0)
+@@ -270,7 +275,8 @@ void RISCVMCCodeEmitter::encodeInstruction(const MCInst &MI, raw_ostream &OS,
+       MI.getOpcode() == RISCV::PseudoCCALLReg ||
+       MI.getOpcode() == RISCV::PseudoCCALL ||
+       MI.getOpcode() == RISCV::PseudoCTAIL ||
+-      MI.getOpcode() == RISCV::PseudoCJump) {
++      MI.getOpcode() == RISCV::PseudoCJump || 
++      MI.getOpcode() == RISCV::PseudoCCALLCustomRA) {
+     expandFunctionCall(MI, OS, Fixups, STI);
+     MCNumEmitted += 2;
+     return;
+diff --git a/llvm/lib/Target/RISCV/RISCVCallingConv.td b/llvm/lib/Target/RISCV/RISCVCallingConv.td
+index f80b0a5a67db..693534b110bc 100644
+--- a/llvm/lib/Target/RISCV/RISCVCallingConv.td
++++ b/llvm/lib/Target/RISCV/RISCVCallingConv.td
+@@ -39,6 +39,10 @@ def CSR_IL32PC64D_L64PC128D
+ // Needed for implementation of RISCVRegisterInfo::getNoPreservedMask()
+ def CSR_NoRegs : CalleeSavedRegs<(add)>;
+ 
++def CSR_CHERI_Uninit : CalleeSavedRegs<(add X1, C1)>;
++
++def CSR_CHERI_Reduced : CalleeSavedRegs<(add X1, C1, X8, C8, X9, C9)>;
++
+ // Interrupt handler needs to save/restore all registers that are used,
+ // both Caller and Callee saved registers.
+ def CSR_Interrupt : CalleeSavedRegs<(add X1,
+diff --git a/llvm/lib/Target/RISCV/RISCVExpandPseudoInsts.cpp b/llvm/lib/Target/RISCV/RISCVExpandPseudoInsts.cpp
+index f748559f062b..479b397959bb 100644
+--- a/llvm/lib/Target/RISCV/RISCVExpandPseudoInsts.cpp
++++ b/llvm/lib/Target/RISCV/RISCVExpandPseudoInsts.cpp
+@@ -12,13 +12,20 @@
+ //
+ //===----------------------------------------------------------------------===//
+ 
++#include "MCTargetDesc/RISCVMCTargetDesc.h"
+ #include "RISCV.h"
+ #include "RISCVInstrInfo.h"
++#include "RISCVSubtarget.h"
+ #include "RISCVTargetMachine.h"
+ 
+ #include "llvm/CodeGen/LivePhysRegs.h"
+ #include "llvm/CodeGen/MachineFunctionPass.h"
++#include "llvm/CodeGen/MachineInstr.h"
+ #include "llvm/CodeGen/MachineInstrBuilder.h"
++#include "llvm/CodeGen/MachineInstrBundle.h"
++#include "llvm/CodeGen/Register.h"
++#include "llvm/IR/CallingConv.h"
++#include "llvm/MC/MCContext.h"
+ 
+ using namespace llvm;
+ 
+@@ -82,6 +89,15 @@ private:
+                          MachineBasicBlock::iterator MBBI, unsigned Opcode);
+   bool expandVSPILL(MachineBasicBlock &MBB, MachineBasicBlock::iterator MBBI);
+   bool expandVRELOAD(MachineBasicBlock &MBB, MachineBasicBlock::iterator MBBI);
++  bool expandPseudoClearRegs(MachineBasicBlock &MBB,
++                             MachineBasicBlock::iterator MBBI,
++                             MachineBasicBlock::iterator &NextMBBI);
++  bool expandPseudoCCALLIndirectSentry(MachineBasicBlock &MBB,
++                          MachineBasicBlock::iterator MBBI,
++                          MachineBasicBlock::iterator &NextMBBI, bool HasFP);
++  bool expandPseudoConditionalReplenishReserveStack(MachineBasicBlock &MBB,
++                                              MachineBasicBlock::iterator MBBI,
++                                              MachineBasicBlock::iterator &NextMBBI);
+ };
+ 
+ char RISCVExpandPseudo::ID = 0;
+@@ -114,6 +130,14 @@ bool RISCVExpandPseudo::expandMI(MachineBasicBlock &MBB,
+   // expanded instructions for each pseudo is correct in the Size field of the
+   // tablegen definition for the pseudo.
+   switch (MBBI->getOpcode()) {
++  case RISCV::PseudoConditionalReplenishReserveStack:
++    return expandPseudoConditionalReplenishReserveStack(MBB, MBBI, NextMBBI);
++  case RISCV::PseudoCCALLIndirectSentryFP:
++    return expandPseudoCCALLIndirectSentry(MBB, MBBI, NextMBBI, true);
++  case RISCV::PseudoCCALLIndirectSentry:
++    return expandPseudoCCALLIndirectSentry(MBB, MBBI, NextMBBI, false);
++  case RISCV::PseudoClearRegs:
++    return expandPseudoClearRegs(MBB, MBBI, NextMBBI);
+   case RISCV::PseudoLLA:
+     return expandLoadLocalAddress(MBB, MBBI, NextMBBI);
+   case RISCV::PseudoLA:
+@@ -183,6 +207,52 @@ bool RISCVExpandPseudo::expandMI(MachineBasicBlock &MBB,
+   return false;
+ }
+ 
++// base mask is used to specify registers which may never be cleared
++// set DDC not to be cleared by default
++// static const uint32_t CapBaseMask = 0xfffffffe;
++
++// bool RISCVExpandPseudo::expandPseudoCClear(
++//     MachineBasicBlock &MBB, MachineBasicBlock::iterator MBBI,
++//     MachineBasicBlock::iterator &NextMBBI
++//     ) {
++// //  MachineFunction *MF = MBB.getParent();
++//   MachineInstr &MI = *MBBI;
++//   DebugLoc DL = MI.getDebugLoc();
++
++//   // retrieve register mask operand from pseudo
++//   const uint32_t *RegMask = MI.getOperand(0).getRegMask();
++//   // The register mask is indexed by the RISCV register enum, which causes the
++//   // capability register mask to be
++// //  const uint32_t FloatBaseMask = 0xffffffff;
++//   uint32_t CapPreserveMask = 0;
++// //  uint32_t FloatClearMask = 0;
++//   static_assert(sizeof(CapPreserveMask) == sizeof(*RegMask), "");
++//   const uint32_t MaskWidth = sizeof(CapPreserveMask) * 8;
++
++//   const auto C0WordIdx = RISCV::C0 / MaskWidth;
++//   const auto C0WordOff = RISCV::C0 % MaskWidth;
++//   CapPreserveMask = // set bits from lower register mask word
++//       CapPreserveMask | (RegMask[C0WordIdx] >> C0WordOff);
++//   CapPreserveMask = // set bits from higher register mask word
++//       CapPreserveMask | (RegMask[C0WordIdx+1] << (MaskWidth - C0WordOff));
++
++//   // negate preserve mask,
++//   uint32_t CapClearMask = CapBaseMask & ~CapPreserveMask;
++
++//   for (int I = 0; I < 4; I++){
++//     uint8_t CapMaskSegment = (CapClearMask >> (I * 8));
++// //    uint8_t FPRegMaskSegment = (RegMask >> (i * 8));
++//     BuildMI(MBB, MBBI, DL, TII->get(RISCV::CClear))
++//         .addImm(I)
++//         .addImm(CapMaskSegment);
++// //    BuildMI(NewMBB, DL, TII->get(RISCV::FPClear))
++// //        .addImm(i)
++// //        .addImm(FPRegMaskSegment);
++//   }
++//   MI.eraseFromParent();
++//   return true;
++// }
++
+ bool RISCVExpandPseudo::expandAuipcInstPair(
+     MachineBasicBlock &MBB, MachineBasicBlock::iterator MBBI,
+     MachineBasicBlock::iterator &NextMBBI, unsigned FlagsHi,
+@@ -289,9 +359,13 @@ bool RISCVExpandPseudo::expandAuipccInstPair(
+   NewMBB->setLabelMustBeEmitted();
+ 
+   MF->insert(++MBB.getIterator(), NewMBB);
+-
+-  BuildMI(NewMBB, DL, TII->get(RISCV::AUIPCC), TmpReg)
+-      .addDisp(Symbol, 0, FlagsHi);
++  if (Symbol.getType() == llvm::MachineOperand::MO_MCSymbol) {
++    BuildMI(NewMBB, DL, TII->get(RISCV::AUIPCC), TmpReg)
++        .addSym(Symbol.getMCSymbol(), FlagsHi);
++  } else {
++    BuildMI(NewMBB, DL, TII->get(RISCV::AUIPCC), TmpReg)
++        .addDisp(Symbol, 0, FlagsHi);
++  }
+   BuildMI(NewMBB, DL, TII->get(SecondOpcode), DestReg)
+       .addReg(TmpReg)
+       .addMBB(NewMBB, RISCVII::MO_PCREL_LO);
+@@ -503,6 +577,133 @@ bool RISCVExpandPseudo::expandVRELOAD(MachineBasicBlock &MBB,
+   return true;
+ }
+ 
++bool RISCVExpandPseudo::expandPseudoCCALLIndirectSentry(MachineBasicBlock &MBB,
++                          MachineBasicBlock::iterator MBBI,
++                          MachineBasicBlock::iterator &NextMBBI, bool HasFP) {
++  MachineFunction *MF = MBB.getParent();
++  MachineInstr &MI = *MBBI;
++  DebugLoc DL = MBBI->getDebugLoc();
++  const TargetInstrInfo *TII = MF->getSubtarget().getInstrInfo();
++  
++  // Registers
++  Register StackCapReg = RISCV::C2;
++  Register FrameCapReg = RISCV::C8;
++  Register IDC = RISCV::C31;
++
++  // Replace PseudoCCALLIndirectSentry with PseudoCCALLCustomRA, keep everything else
++  MachineInstr *JumpInst = BuildMI(MBB, MBBI, DL, 
++    TII->get(RISCV::PseudoCCALLCustomRA), MI.getOperand(0).getReg());
++  JumpInst->addOperand(MI.getOperand(1));
++  JumpInst->setPostInstrSymbol(*MF, MI.getPostInstrSymbol());
++  // add all other operands
++  for (auto OpIdx = 2u; OpIdx < MI.getNumOperands(); OpIdx++)
++    JumpInst->addOperand(MI.getOperand(OpIdx));
++
++  // now emit instructions to restore cfp and csp
++  BuildMI(MBB, MBBI, DL, TII->get(RISCV::CLC_128), StackCapReg)
++    .addReg(IDC).addImm(16);
++  if (HasFP)
++    BuildMI(MBB, MBBI, DL, TII->get(RISCV::CLC_128), FrameCapReg)
++      .addReg(IDC).addImm(-16);
++
++  MI.eraseFromParent();
++  return true;
++}
++
++bool RISCVExpandPseudo::expandPseudoClearRegs(MachineBasicBlock &MBB,
++                                              MachineBasicBlock::iterator MBBI,
++                                              MachineBasicBlock::iterator &NextMBBI) {
++  MachineFunction *MF = MBB.getParent();
++  MachineInstr &MI = *MBBI;
++  DebugLoc DL = MBBI->getDebugLoc();
++  const TargetInstrInfo *TII = MF->getSubtarget().getInstrInfo();
++  const TargetRegisterInfo *TRI = MF->getSubtarget().getRegisterInfo();
++
++  const uint32_t CapClearMask = MI.getOperand(0).getImm();
++
++  MachineInstrBuilder CClearBuilder;
++  Register CurrentReg;
++  for (int I = 0; I < 4; I++){
++    uint8_t CapMaskSegment = (CapClearMask >> (I * 8));
++    CClearBuilder = BuildMI(MBB, MBBI, DL, TII->get(RISCV::PseudoCClear))
++        .addImm(I)
++        .addImm(CapMaskSegment);
++    for (int RegIdx = 0; RegIdx < 8; RegIdx++) {
++      if (CapMaskSegment & (1 << RegIdx)) {
++        CurrentReg = RISCV::C0 + I*8 + RegIdx;
++        CClearBuilder->addRegisterDefined(CurrentReg, TRI);
++      }
++    }
++  }
++  MI.eraseFromParent();
++  return true;
++}
++
++bool RISCVExpandPseudo::expandPseudoConditionalReplenishReserveStack(
++    MachineBasicBlock &MBB,
++    MachineBasicBlock::iterator MBBI,
++    MachineBasicBlock::iterator &NextMBBI) {
++  MachineFunction *MF = MBB.getParent();
++  const auto &STI = MBB.getParent()->getSubtarget<RISCVSubtarget>();
++  MachineInstr &MI = *MBBI;
++  auto DL = MI.getDebugLoc();
++  Register ThresholdReg = MI.getOperand(0).getReg();
++  Register StackSpaceReg = MI.getOperand(1).getReg();
++  Register StackReg = RISCV::C2;
++
++  bool hasUninitIsentryCC =
++      MF->getFunction().getCallingConv() == CallingConv::CHERI_Uninit
++      && STI.getCHERIUninitEncap() == RISCVSubtarget::isentry;
++
++  MachineBasicBlock *EndReplenishMBB = MF->CreateMachineBasicBlock(MBB.getBasicBlock());
++
++  // Tell AsmPrinter that we unconditionally want the symbol of this label to be
++  // emitted.
++  EndReplenishMBB->setLabelMustBeEmitted();
++
++  MF->insert(++MBB.getIterator(), EndReplenishMBB);
++
++  // Move all the rest of the instructions to NewMBB.
++  EndReplenishMBB->splice(EndReplenishMBB->end(), &MBB, std::next(MBBI), MBB.end());
++  // Update machine-CFG edges.
++  EndReplenishMBB->transferSuccessorsAndUpdatePHIs(&MBB);
++  // Make the original basic block fall-through to the new.
++  MBB.addSuccessor(EndReplenishMBB);
++
++  // Make sure live-ins are correctly attached to this new basic block.
++  LivePhysRegs LiveRegs;
++  computeAndAddLiveIns(LiveRegs, *EndReplenishMBB);
++
++  // bge r_thr, r_st, end_replenish
++  BuildMI(MBB, MBBI, DL, TII->get(RISCV::BGE))
++  .addReg(StackSpaceReg)
++  .addReg(ThresholdReg)
++  .addMBB(EndReplenishMBB);
++    
++  // With indirect sentry, stack capability itself is sealed and used as return cap.
++  if (!hasUninitIsentryCC){
++    // usc csp, csp, csp
++    BuildMI(MBB, MBBI, DL, TII->get(RISCV::USC_CAP), StackReg)
++        .addReg(StackReg)
++        .addReg(StackReg);
++  }
++  // usc csp, cra, csp
++  BuildMI(MBB, MBBI, DL, TII->get(RISCV::USC_CAP), StackReg)
++      .addReg(RISCV::C1)
++      .addReg(StackReg);
++
++  // ccall __replenish_entry
++  BuildMI(MBB, MBBI, DL, TII->get(RISCV::PseudoCCALL))
++      .addExternalSymbol(
++        hasUninitIsentryCC ? "__replenish_entry_isentry" : "__replenish_entry",
++        RISCVII::MO_CCALL
++      );
++
++  NextMBBI = MBB.end();
++  MI.eraseFromParent();
++  return true;
++}
++
+ } // end of anonymous namespace
+ 
+ INITIALIZE_PASS(RISCVExpandPseudo, "riscv-expand-pseudo",
+diff --git a/llvm/lib/Target/RISCV/RISCVFrameLowering.cpp b/llvm/lib/Target/RISCV/RISCVFrameLowering.cpp
+index b9f1818a42dd..213c5c0b02ce 100644
+--- a/llvm/lib/Target/RISCV/RISCVFrameLowering.cpp
++++ b/llvm/lib/Target/RISCV/RISCVFrameLowering.cpp
+@@ -11,20 +11,33 @@
+ //===----------------------------------------------------------------------===//
+ 
+ #include "RISCVFrameLowering.h"
++#include "MCTargetDesc/RISCVMCTargetDesc.h"
++#include "RISCVInstrInfo.h"
+ #include "RISCVMachineFunctionInfo.h"
++#include "RISCVRegisterInfo.h"
+ #include "RISCVSubtarget.h"
++#include "llvm/ADT/SmallVector.h"
++#include "llvm/CodeGen/MachineBasicBlock.h"
+ #include "llvm/CodeGen/MachineFrameInfo.h"
+ #include "llvm/CodeGen/MachineFunction.h"
++#include "llvm/CodeGen/MachineInstr.h"
+ #include "llvm/CodeGen/MachineInstrBuilder.h"
++#include "llvm/CodeGen/MachineOperand.h"
+ #include "llvm/CodeGen/MachineRegisterInfo.h"
++#include "llvm/CodeGen/Register.h"
+ #include "llvm/CodeGen/RegisterScavenging.h"
+ #include "llvm/IR/DiagnosticInfo.h"
+ #include "llvm/MC/MCDwarf.h"
+ 
+ #include <algorithm>
++#include <cstdint>
+ 
+ using namespace llvm;
+ 
++static cl::opt<bool> CHERIUninitClearCalleeStack(
++    "cheri-uninit-clear-callee-stack",
++    cl::desc("Clear callee stack upon return in uninit ABI"), cl::init(true));
++
+ // For now we use x18, a.k.a s2, as pointer to shadow call stack.
+ // User should explicitly set -ffixed-x18 and not use x18 in their asm.
+ static void emitSCSPrologue(MachineFunction &MF, MachineBasicBlock &MBB,
+@@ -230,6 +243,14 @@ bool RISCVFrameLowering::hasFP(const MachineFunction &MF) const {
+   const TargetRegisterInfo *RegInfo = MF.getSubtarget().getRegisterInfo();
+ 
+   const MachineFrameInfo &MFI = MF.getFrameInfo();
++
++  // "Large" just means the frame needs to be more than 16-byte aligned for
++  // bounds to be representable on CHERI Concentrate. We disable FP in this
++  // case because FP bounds get set to only the stack frame.
++  bool IsLargeFrame = !isInt<14>(getStackSizeWithRVVPadding(MF));
++  if (STI.hasUninitStack() && IsLargeFrame)
++    return false;
++
+   return MF.getTarget().Options.DisableFramePointerElim(MF) ||
+          RegInfo->hasStackRealignment(MF) || MFI.hasVarSizedObjects() ||
+          MFI.isFrameAddressTaken();
+@@ -300,6 +321,27 @@ void RISCVFrameLowering::adjustReg(MachineBasicBlock &MBB,
+   if (DestReg == SrcReg && Val == 0)
+     return;
+ 
++  if (STI.hasUninitStack()) {
++    assert(!(SrcReg != getSPReg() && DestReg == getSPReg() && Val >= 0) &&
++           "Positive adjustment from other register into stack register not "
++           "supported!");
++    if (Val < 0 && SrcReg == getSPReg()) {
++      assert(DestReg == SrcReg &&
++             "Unexpected adjustment of stack cap into other register");
++      return adjustUninitStackCap(MBB, MBBI, DL, Val, Flag);
++    }
++    if (Val >= 0 && SrcReg == getSPReg()) {
++      if (SrcReg == DestReg)
++        return adjustUninitStackCap(MBB, MBBI, DL, Val, Flag);
++      return deriveFromUninitStackCap(MBB, MBBI, DL, DestReg, Val, Flag);
++    }
++    if (Val < 0 && DestReg == getSPReg()) {
++      assert(SrcReg == getFPReg() &&
++             "Unexpected source from which CSP is being set.");
++      return setUninitStackCapAddress(MBB, MBBI, DL, RISCV::X8, Val, Flag);
++    }
++  }
++
+   if (isInt<12>(Val)) {
+     unsigned Opc;
+     if (RISCVABI::isCheriPureCapABI(STI.getTargetABI()))
+@@ -358,6 +400,172 @@ void RISCVFrameLowering::adjustReg(MachineBasicBlock &MBB,
+       .setMIFlag(Flag);
+ }
+ 
++void RISCVFrameLowering::adjustUninitStackCap(MachineBasicBlock &MBB,
++                                              MachineBasicBlock::iterator MBBI,
++                                              const DebugLoc &DL,
++                                              int64_t Amount,
++                                              MachineInstr::MIFlag Flag) const {
++  assert(Amount % 16 == 0 && "Offset not capability aligned");
++  const RISCVInstrInfo *TII = STI.getInstrInfo();
++  MachineRegisterInfo &MRI = MBB.getParent()->getRegInfo();
++  const Register StackCap = getSPReg();
++  if (Amount < 0) {
++    for (int64_t Idx = Amount; Idx < 0; Idx += 16)
++      BuildMI(MBB, MBBI, DL, TII->get(RISCV::USC_CAP), StackCap)
++          .addReg(RISCV::C0)
++          .addReg(StackCap)
++          .setMIFlag(Flag);
++  } else {
++    if (CHERIUninitClearCalleeStack) {
++      /* Build a sequence like this:
++      csc c0, 0(csp)
++      ...
++      csc c0, 2016(csp)
++      cincoffset csp, csp, 2032
++      csc c0, 0(csp)
++      ...
++      csc c0, ...(csp)
++      cincoffset csp, csp, ...
++      */ 
++      int64_t MaxImmediate = 2032;
++      for(int64_t SubAmount = Amount; SubAmount > 0; SubAmount -= MaxImmediate){
++        int64_t LoopAmount = std::min(SubAmount, MaxImmediate);
++        for (int64_t Offset = 0; Offset < LoopAmount; Offset += 16)
++          BuildMI(MBB, MBBI, DL, TII->get(RISCV::CSC_128))
++              .addReg(RISCV::C0)
++              .addReg(StackCap)
++              .addImm(Offset)
++              .setMIFlag(Flag);
++        BuildMI(MBB, MBBI, DL, TII->get(RISCV::CIncOffsetImm), StackCap)
++            .addReg(StackCap)
++            .addImm(LoopAmount)
++            .setMIFlag(Flag);
++      }
++    } else {
++      if (!isInt<12>(Amount)) {
++        Register AmountReg = MRI.createVirtualRegister(&RISCV::GPRRegClass);
++        TII->movImm(MBB, MBBI, DL, AmountReg, Amount, Flag);
++        BuildMI(MBB, MBBI, DL, TII->get(RISCV::CIncOffset), StackCap)
++          .addReg(StackCap)
++          .addReg(AmountReg)
++          .setMIFlag(Flag);
++      } else {
++        BuildMI(MBB, MBBI, DL, TII->get(RISCV::CIncOffsetImm), StackCap)
++          .addReg(StackCap)
++          .addImm(Amount)
++          .setMIFlag(Flag);
++      }
++    }
++  }
++}
++
++/*
++  TODO: this way of deriving cuts a couple of corners which are problematic in
++  the general case:
++  - No regard is paid to rounding errors which may occur with larger objects. An
++  implementation which allows for this should take care to properly align
++  objects.
++  - Varargs bounds can't statically be set, so the bounds of the frame pointer
++  are set with a very large margin to make sure all arguments are in bounds.
++*/
++void RISCVFrameLowering::deriveFromUninitStackCap(
++    MachineBasicBlock &MBB, MachineBasicBlock::iterator MBBI,
++    const DebugLoc &DL, Register TargetReg, int64_t Amount,
++    MachineInstr::MIFlag Flag) const {
++  assert(Amount >= 0 &&
++         "Attempting to derive cap from stack cap with negative offset!");
++  assert(TargetReg == getFPReg() && "temp safeguard, target has to be fp");
++  const RISCVInstrInfo *TII = STI.getInstrInfo();
++  const MachineFrameInfo &MFI = MBB.getParent()->getFrameInfo();
++  const Align StackAlign = MFI.getMaxAlign();
++  const Register StackCap = getSPReg();
++  MachineRegisterInfo &MRI = MBB.getParent()->getRegInfo();
++  const Register TempReg = MRI.createVirtualRegister(&RISCV::GPRRegClass);
++
++  uint64_t FrameSize = (uint64_t)Amount;
++  // for some reason stack passed variables are not included in framesize
++  for (auto ObjIdx = MFI.getObjectIndexBegin(); ObjIdx < MFI.getObjectIndexEnd(); ObjIdx++)
++  {
++    if (!MFI.isDeadObjectIndex(ObjIdx) && MFI.getObjectOffset(ObjIdx) >= 0) {
++      FrameSize += MFI.getObjectSize(ObjIdx);
++    }
++  }
++  // if (MFI.hasVAStart()) 
++  //   FrameSize += 256; // add an error margin if va_start is called
++  FrameSize = alignTo(FrameSize, StackAlign);
++  MachineInstrBuilder CSetBoundsBuilder;
++  MachineInstrBuilder CIncOffsetBuilder;
++  // If the framesize exceeds the maximum immediate size, emit a sequence of
++  // instructions to build it.
++  if (!isInt<12>(FrameSize)) {
++    TII->movImm(MBB, MBBI, DL, TempReg, FrameSize, Flag);
++    CSetBoundsBuilder =
++        BuildMI(MBB, MBBI, DL, TII->get(RISCV::CSetBounds), TargetReg)
++            .addReg(StackCap)
++            .addReg(TempReg);
++  } else {
++    // Otherwise adjust with immediates directly
++    CSetBoundsBuilder =
++        BuildMI(MBB, MBBI, DL, TII->get(RISCV::CSetBoundsImm), TargetReg)
++            .addReg(StackCap)
++            .addImm(FrameSize);
++  }
++  if (!isInt<12>(Amount)) {
++    assert(!isInt<12>(FrameSize) && "Something went wrong...");
++    int64_t FrameSizeAmountDiff = FrameSize - Amount;
++    assert(isInt<12>(FrameSizeAmountDiff) && "Expected to be able to build this value with immediate!");
++    if (FrameSizeAmountDiff) {
++    BuildMI(MBB, MBBI, DL, TII->get(RISCV::ADDI), TempReg)
++        .addReg(TempReg)
++        .addImm(-FrameSizeAmountDiff)
++        .setMIFlag(Flag);
++    }
++    CIncOffsetBuilder = BuildMI(MBB, MBBI, DL, TII->get(RISCV::CIncOffset),
++        TargetReg)
++        .addReg(TargetReg)
++        .addReg(TempReg);
++  } else {
++    CIncOffsetBuilder = BuildMI(MBB, MBBI, DL, TII->get(RISCV::CIncOffsetImm),
++        TargetReg)
++            .addReg(TargetReg)
++            .addImm(Amount);
++  }
++  CSetBoundsBuilder.setMIFlag(Flag);
++  CIncOffsetBuilder.setMIFlag(Flag);
++}
++
++void RISCVFrameLowering::setUninitStackCapAddress(
++    MachineBasicBlock &MBB, MachineBasicBlock::iterator MBBI,
++    const DebugLoc &DL, Register SourceReg, int64_t Amount,
++    MachineInstr::MIFlag Flag) const {
++  assert(Amount < 0 && "Expected adjustment to be negative!");
++  assert(SourceReg == RISCV::X8 &&
++         "Expected source reg to be (integer) frame reg!");
++
++  const RISCVInstrInfo *TII = STI.getInstrInfo();
++  const Register StackCap = getSPReg();
++  MachineRegisterInfo &MRI = MBB.getParent()->getRegInfo();
++  const Register TempReg = MRI.createVirtualRegister(&RISCV::GPRRegClass);
++
++  if (Amount < -(1<<11)) {
++    TII->movImm(MBB, MBBI, DL, TempReg, Amount, Flag);
++    BuildMI(MBB, MBBI, DL, TII->get(RISCV::ADD), TempReg)
++      .addReg(SourceReg)
++      .addReg(TempReg)
++      .setMIFlag(Flag);
++  } else {
++    BuildMI(MBB, MBBI, DL, TII->get(RISCV::ADDI), TempReg)
++      .addReg(SourceReg)
++      .addImm(Amount)
++      .setMIFlag(Flag);
++  }
++
++  BuildMI(MBB, MBBI, DL, TII->get(RISCV::CSetAddr), StackCap)
++      .addReg(StackCap)
++      .addReg(TempReg)
++      .setMIFlag(Flag);
++}
++
+ // Returns the register used to hold the frame pointer.
+ Register RISCVFrameLowering::getFPReg() const {
+   if (RISCVABI::isCheriPureCapABI(STI.getTargetABI()))
+@@ -413,6 +621,31 @@ void RISCVFrameLowering::adjustStackForRVV(MachineFunction &MF,
+       .setMIFlag(Flag);
+ }
+ 
++#define RESERVE_STACK_REPLENISH_THRESHOLD (8192)
++void RISCVFrameLowering::emitReplenishCheck(MachineFunction &MF, MachineBasicBlock &MBB,
++                               MachineBasicBlock::iterator MBBI,
++                               const DebugLoc &DL) const {
++  auto Flag = MachineInstr::FrameSetup;
++  MachineRegisterInfo &MRI = MBB.getParent()->getRegInfo();
++  Register ThresholdReg = MRI.createVirtualRegister(&RISCV::GPRRegClass);
++  Register StackSpaceReg = MRI.createVirtualRegister(&RISCV::GPRRegClass);
++  const RISCVInstrInfo *TII = STI.getInstrInfo();
++
++  // li r_thr, threshold
++  TII->movImm(MBB, MBBI, DL, ThresholdReg, RESERVE_STACK_REPLENISH_THRESHOLD, Flag);
++  // cgetoffset r_st, csp 
++  BuildMI(MBB, MBBI, DL, TII->get(RISCV::CGetOffset), StackSpaceReg)
++      .addReg(getSPReg())
++      .setMIFlag(Flag);
++
++  BuildMI(MBB, MBBI, DL, TII->get(RISCV::PseudoConditionalReplenishReserveStack))
++      .addReg(ThresholdReg)
++      .addReg(StackSpaceReg)
++      .setMIFlag(Flag);
++
++  return;
++}
++
+ void RISCVFrameLowering::emitPrologue(MachineFunction &MF,
+                                       MachineBasicBlock &MBB) const {
+   MachineFrameInfo &MFI = MF.getFrameInfo();
+@@ -486,6 +719,11 @@ void RISCVFrameLowering::emitPrologue(MachineFunction &MF,
+     MF.getFunction().getContext().diagnose(DiagnosticInfoUnsupported{
+         MF.getFunction(), "Stack pointer required, but has been reserved."});
+ 
++  assert(!(STI.hasReserveStack() && RealStackSize > 16384) 
++      && "Individual stack frame too large for reserve stack"); 
++  // If there is a reserve stack, emit replenishment check.
++  if (STI.hasReserveStack()) emitReplenishCheck(MF, MBB, MBBI, DL);
++
+   uint64_t FirstSPAdjustAmount = getFirstSPAdjustAmount(MF);
+   // Split the SP adjustment to reduce the offsets of callee saved spill.
+   if (FirstSPAdjustAmount) {
+@@ -559,6 +797,10 @@ void RISCVFrameLowering::emitPrologue(MachineFunction &MF,
+            "SecondSPAdjustAmount should be greater than zero");
+     adjustReg(MBB, MBBI, DL, SPReg, SPReg, -SecondSPAdjustAmount,
+               MachineInstr::FrameSetup);
++      // emit second FP adjustment to ensure it has authority over entire stack frame
++      if (STI.hasUninitStack() && hasFP(MF))
++        adjustReg(MBB, MBBI, DL, FPReg, SPReg, getStackSizeWithRVVPadding(MF),
++              MachineInstr::FrameSetup);
+ 
+     // If we are using a frame-pointer, and thus emitted ".cfi_def_cfa fp, 0",
+     // don't emit an sp-based .cfi_def_cfa_offset
+@@ -756,7 +998,7 @@ RISCVFrameLowering::getFrameIndexReference(const MachineFunction &MF, int FI,
+     MaxCSFI = CSI[CSI.size() - 1].getFrameIdx();
+   }
+ 
+-  if (FI >= MinCSFI && FI <= MaxCSFI) {
++  if ((FI >= MinCSFI && FI <= MaxCSFI)) { // || IsUninitVarArgRef) {
+     FrameReg = getSPReg();
+ 
+     if (FirstSPAdjustAmount)
+diff --git a/llvm/lib/Target/RISCV/RISCVFrameLowering.h b/llvm/lib/Target/RISCV/RISCVFrameLowering.h
+index b8f47e49b465..7bd76ec41c30 100644
+--- a/llvm/lib/Target/RISCV/RISCVFrameLowering.h
++++ b/llvm/lib/Target/RISCV/RISCVFrameLowering.h
+@@ -13,6 +13,8 @@
+ #ifndef LLVM_LIB_TARGET_RISCV_RISCVFRAMELOWERING_H
+ #define LLVM_LIB_TARGET_RISCV_RISCVFRAMELOWERING_H
+ 
++#include "llvm/CodeGen/MachineBasicBlock.h"
++#include "llvm/CodeGen/MachineInstr.h"
+ #include "llvm/CodeGen/TargetFrameLowering.h"
+ #include "llvm/Support/TypeSize.h"
+ 
+@@ -88,6 +90,23 @@ private:
+                          int64_t Amount, MachineInstr::MIFlag Flag) const;
+   std::pair<int64_t, Align>
+   assignRVVStackObjectOffsets(MachineFunction &MF) const;
++  void adjustUninitStackCap(MachineBasicBlock &MBB,
++                            MachineBasicBlock::iterator MBBI,
++                            const DebugLoc &DL, int64_t Amount,
++                            MachineInstr::MIFlag Flag) const;
++  void deriveFromUninitStackCap(MachineBasicBlock &MBB,
++                                MachineBasicBlock::iterator MBBI,
++                                const DebugLoc &DL, Register TargetReg,
++                                int64_t Amount,
++                                MachineInstr::MIFlag Flag) const;
++  void setUninitStackCapAddress(MachineBasicBlock &MBB,
++                                MachineBasicBlock::iterator MBBI,
++                                const DebugLoc &DL, Register SourceReg,
++                                int64_t Amount,
++                                MachineInstr::MIFlag Flag) const;
++  void emitReplenishCheck(MachineFunction &MF, MachineBasicBlock &MBB,
++                          MachineBasicBlock::iterator MI,
++                          const DebugLoc &DL) const;
+ };
+ } // namespace llvm
+ #endif
+diff --git a/llvm/lib/Target/RISCV/RISCVISelLowering.cpp b/llvm/lib/Target/RISCV/RISCVISelLowering.cpp
+index 8b5588a5515c..2a5be06e8632 100644
+--- a/llvm/lib/Target/RISCV/RISCVISelLowering.cpp
++++ b/llvm/lib/Target/RISCV/RISCVISelLowering.cpp
+@@ -12,8 +12,10 @@
+ //===----------------------------------------------------------------------===//
+ 
+ #include "RISCVISelLowering.h"
+-#include "MCTargetDesc/RISCVMatInt.h"
++#include "MCTargetDesc/RISCVBaseInfo.h"
+ #include "MCTargetDesc/RISCVCompressedCap.h"
++#include "MCTargetDesc/RISCVMCTargetDesc.h"
++#include "MCTargetDesc/RISCVMatInt.h"
+ #include "RISCV.h"
+ #include "RISCVMachineFunctionInfo.h"
+ #include "RISCVRegisterInfo.h"
+@@ -22,28 +24,46 @@
+ #include "llvm/ADT/SmallSet.h"
+ #include "llvm/ADT/Statistic.h"
+ #include "llvm/Analysis/MemoryLocation.h"
++#include "llvm/CodeGen/CallingConvLower.h"
++#include "llvm/CodeGen/ISDOpcodes.h"
++#include "llvm/CodeGen/MachineBasicBlock.h"
+ #include "llvm/CodeGen/MachineFrameInfo.h"
+ #include "llvm/CodeGen/MachineFunction.h"
++#include "llvm/CodeGen/MachineInstr.h"
+ #include "llvm/CodeGen/MachineInstrBuilder.h"
+ #include "llvm/CodeGen/MachineJumpTableInfo.h"
++#include "llvm/CodeGen/MachineMemOperand.h"
++#include "llvm/CodeGen/MachineModuleInfo.h"
++#include "llvm/CodeGen/MachineOperand.h"
+ #include "llvm/CodeGen/MachineRegisterInfo.h"
++#include "llvm/CodeGen/Register.h"
++#include "llvm/CodeGen/SelectionDAGNodes.h"
+ #include "llvm/CodeGen/TargetLoweringObjectFileImpl.h"
++#include "llvm/CodeGen/TargetRegisterInfo.h"
+ #include "llvm/CodeGen/ValueTypes.h"
++#include "llvm/IR/CallingConv.h"
+ #include "llvm/IR/DiagnosticInfo.h"
+ #include "llvm/IR/DiagnosticPrinter.h"
+ #include "llvm/IR/IRBuilder.h"
++#include "llvm/IR/Intrinsics.h"
+ #include "llvm/IR/IntrinsicsRISCV.h"
+ #include "llvm/IR/PatternMatch.h"
++#include "llvm/MC/MCContext.h"
+ #include "llvm/Support/Debug.h"
+ #include "llvm/Support/ErrorHandling.h"
+ #include "llvm/Support/KnownBits.h"
+ #include "llvm/Support/MathExtras.h"
+ #include "llvm/Support/raw_ostream.h"
++#include <cstdint>
++#include <utility>
++#include "CHERIUninitTrampoline.h"
+ 
+ using namespace llvm;
+ 
+ #define DEBUG_TYPE "riscv-lower"
+ 
++#define CHERI_UNINIT_SHRINK
++
+ STATISTIC(NumTailCalls, "Number of tail calls");
+ 
+ static cl::opt<bool>
+@@ -52,6 +72,16 @@ static cl::opt<bool>
+                                            "pure-capability function calls"),
+                                   cl::init(false), cl::Hidden);
+ 
++static cl::opt<bool>
++    CHERIUninitStackSplit("cheri-uninit-stack-split",
++    cl::desc("Split stack on caller-callee boundary upon call for uninit CC"),
++    cl::init(true));
++
++static cl::opt<bool> CHERIInstrumentSecureCalls(
++    "cheri-instrument-secure-calls",
++    cl::desc("Count number of secure calls made during execution"), cl::init(false));
++
++
+ RISCVTargetLowering::RISCVTargetLowering(const TargetMachine &TM,
+                                          const RISCVSubtarget &STI)
+     : TargetLowering(TM), Subtarget(STI) {
+@@ -4230,16 +4260,24 @@ SDValue RISCVTargetLowering::lowerBRCOND(SDValue Op, SelectionDAG &DAG) const {
+ SDValue RISCVTargetLowering::lowerVASTART(SDValue Op, SelectionDAG &DAG) const {
+   MachineFunction &MF = DAG.getMachineFunction();
+   RISCVMachineFunctionInfo *FuncInfo = MF.getInfo<RISCVMachineFunctionInfo>();
++  EVT PtrVT = getPointerTy(DAG.getDataLayout(),
++                             DAG.getDataLayout().getGlobalsAddressSpace());
+ 
+   SDLoc DL(Op);
+   unsigned AllocaAS = MF.getDataLayout().getAllocaAddrSpace();
+-  SDValue FI = DAG.getFrameIndex(FuncInfo->getVarArgsFrameIndex(),
+-                                 getPointerTy(MF.getDataLayout(), AllocaAS));
++
++  SDValue VAPtr;
++  if (Subtarget.hasUninitStack() || Subtarget.hasReserveStack()) {
++    VAPtr = DAG.getRegister(FuncInfo->getStackPassedArgRegister(), PtrVT);
++  } else {
++    VAPtr = DAG.getFrameIndex(FuncInfo->getVarArgsFrameIndex(),
++                              getPointerTy(MF.getDataLayout(), AllocaAS));
++  }
+ 
+   // vastart just stores the address of the VarArgsFrameIndex slot into the
+   // memory location argument.
+   const Value *SV = cast<SrcValueSDNode>(Op.getOperand(2))->getValue();
+-  return DAG.getStore(Op.getOperand(0), DL, FI, Op.getOperand(1),
++  return DAG.getStore(Op.getOperand(0), DL, VAPtr, Op.getOperand(1),
+                       MachinePointerInfo(SV));
+ }
+ 
+@@ -10637,6 +10675,157 @@ static MachineBasicBlock *emitSelectPseudo(MachineInstr &MI,
+   return TailMBB;
+ }
+ 
++static MachineBasicBlock *
++transformPseudoClearRegs(MachineInstr &MI, MachineBasicBlock *BB,
++                    const RISCVSubtarget &Subtarget) {
++  // base mask is used to specify registers which may never be cleared
++  // set DDC not to be cleared by default
++  // static const uint32_t CapBaseMask = 0xfffffffe;
++  MachineInstrBuilder MIB = MachineInstrBuilder(*BB->getParent(), &MI);
++  DebugLoc DL = MI.getDebugLoc();
++  const TargetRegisterInfo *TRI = Subtarget.getRegisterInfo();
++  
++  // add mask as immediate to MI, and add implicit defs for RA
++  uint32_t CapClearMask = MI.getOperand(0).getImm();
++  Register CurrentReg;
++  for (int RegIdx = 1; RegIdx < 32; RegIdx++) {
++    if (CapClearMask & (1 << RegIdx)) {
++      CurrentReg = RISCV::C0 + RegIdx;
++      MIB->addRegisterDefined(CurrentReg, TRI);
++    }
++  }
++  return BB;
++}
++
++static MachineBasicBlock *
++emitPseudoUCCALL(MachineInstr &MI, MachineBasicBlock *BB,
++                 const RISCVSubtarget &Subtarget) {
++  MachineBasicBlock &MBB = *BB;
++  MachineBasicBlock::iterator MBBI = std::next(MachineBasicBlock::iterator(MI));
++  MachineFunction &MF = *BB->getParent();
++  DebugLoc DL = MI.getDebugLoc();
++  const TargetInstrInfo *TII = Subtarget.getInstrInfo();
++
++  // Registers
++  // Register StackCapReg = RISCV::C2;
++  // Register FrameCapReg = RISCV::C8;
++  // Register IDC = RISCV::C31;
++
++  int CallOpc; 
++  if (Subtarget.getCHERIUninitEncap() == RISCVSubtarget::isentry)
++    if (RISCVGenRegisterInfo::getFrameLowering(MF)->hasFP(MF))
++      CallOpc = RISCV::PseudoCCALLIndirectSentryFP;
++    else 
++      CallOpc = RISCV::PseudoCCALLIndirectSentry;
++  else 
++    CallOpc = RISCV::PseudoCCALLCustomRA;
++
++  // Emit jump, supply register for auipcc, same as used by ccall
++  MachineInstr *JumpInst = BuildMI(MBB, MBBI, DL, 
++    TII->get(CallOpc), RISCV::C6);
++  JumpInst->addOperand(MI.getOperand(0));
++  JumpInst->setPostInstrSymbol(MF, MI.getOperand(1).getMCSymbol());
++  // add all other operands
++  for (auto OpIdx = 2u; OpIdx < MI.getNumOperands(); OpIdx++)
++    JumpInst->addOperand(MI.getOperand(OpIdx));
++
++  // Restore caller local state if isentry return encap is used
++  // if (CHERIUninitReturnEncap == isentry) {
++  //   BuildMI(MBB, MBBI, DL, TII->get(RISCV::CLC_128), StackCapReg)
++  //     .addReg(IDC).addImm(16);
++  //   if (RISCVGenRegisterInfo::getFrameLowering(MF)->hasFP(MF))
++  //     BuildMI(MBB, MBBI, DL, TII->get(RISCV::CLC_128), FrameCapReg)
++  //       .addReg(IDC).addImm(-16);
++  // }
++
++  // remove expanded pseudo-instruction
++  MI.eraseFromParent();
++  return BB;
++}
++
++static MachineBasicBlock *
++emitUninitStoreStackArgs(MachineInstr &MI, MachineBasicBlock *BB,
++                         const RISCVSubtarget &Subtarget) {
++  assert(false && "Implement this!");
++  // MachineBasicBlock &MBB = *BB;
++  // MachineBasicBlock::iterator MBBI = std::next(MachineBasicBlock::iterator(MI));
++  // DebugLoc DL = MI.getDebugLoc();
++  // const TargetInstrInfo *TII = Subtarget.getInstrInfo();
++  // Register StackCapReg = RISCV::C2;
++
++  // unsigned int ArgC = MI.getOperand(0).getImm();
++  // int CurrOffset, NextOffset = 0;
++  // for (unsigned int ArgI = 1; ArgI < 2*ArgC; ArgI+=2) {
++  //   CurrOffset = MI.getOperand(ArgI+1).getImm();
++  //   NextOffset = MI.getOperand(ArgI+3).getImm();
++  //   BuildMI(MBB, MI, DL, 
++  //       TII->get(getUnsignedWriteOpcodeForSize(NextOffset - CurrOffset)), StackCapReg)
++  //     .addReg(MI.getOperand(ArgI).getReg())
++  //     .addReg(StackCapReg);
++  // }
++  // // Last argument we choose the store size (or emit zeros) so the arg block is 16-byte aligned
++  // MI.getOperand(2*ArgC + 1).getReg();
++  return BB;
++}
++
++static MachineBasicBlock *
++emitUninitShrinkStack(MachineInstr &MI, MachineBasicBlock *BB,
++                      const RISCVSubtarget &Subtarget) {
++  MachineBasicBlock &MBB = *BB;
++  MachineBasicBlock::iterator MBBI = std::next(MachineBasicBlock::iterator(MI));
++  DebugLoc DL = MI.getDebugLoc();
++  const TargetInstrInfo *TII = Subtarget.getInstrInfo();
++  Register StackCapReg = RISCV::C2;
++  // fuck it hardcode this, it gets clobbered by cjump anyway
++  Register TempReg = RISCV::X6;
++  BuildMI(MBB, MBBI, DL, TII->get(RISCV::CShrinkImm), StackCapReg)
++      .addReg(StackCapReg)
++      .addImm(MI.getOperand(0).getImm());
++  BuildMI(MBB, MBBI, DL, TII->get(RISCV::CGetTop), TempReg)
++      .addReg(StackCapReg);
++  BuildMI(MBB, MBBI, DL, TII->get(RISCV::CSetAddr), StackCapReg)
++      .addReg(StackCapReg).addReg(TempReg);
++  MI.eraseFromParent();
++  return BB;
++}
++
++static MachineBasicBlock *
++emitUninitShrinkReserveStack(MachineInstr &MI, MachineBasicBlock *BB,
++                             const RISCVSubtarget &Subtarget) {
++  MachineBasicBlock &MBB = *BB;
++  MachineBasicBlock::iterator MBBI = std::next(MachineBasicBlock::iterator(MI));
++  DebugLoc DL = MI.getDebugLoc();
++  const TargetInstrInfo *TII = Subtarget.getInstrInfo();
++  MachineRegisterInfo &RegInfo = BB->getParent()->getRegInfo();
++
++  Register StackReg = RISCV::C2;
++  Register ReserveStackReg = RISCV::C31;
++
++  Register UntaggedReserveReg = RegInfo.createVirtualRegister(&RISCV::GPCRRegClass);
++  BuildMI(MBB, MBBI, DL, TII->get(RISCV::CClearTag), UntaggedReserveReg)
++      .addReg(ReserveStackReg);
++
++  Register StackBaseReg = RegInfo.createVirtualRegister(&RISCV::GPRRegClass);
++  BuildMI(MBB, MBBI, DL, TII->get(RISCV::CGetBase), StackBaseReg)
++      .addReg(StackReg);
++
++  Register AddrSetReserveReg = RegInfo.createVirtualRegister(&RISCV::GPCRRegClass);
++  BuildMI(MBB, MBBI, DL, TII->get(RISCV::CSetAddr), AddrSetReserveReg)
++      .addReg(UntaggedReserveReg)
++      .addReg(StackBaseReg);
++  
++  Register FinalUntaggedReserveReg = RegInfo.createVirtualRegister(&RISCV::GPCRRegClass);
++  BuildMI(MBB, MBBI, DL, TII->get(RISCV::CShrinkImm), FinalUntaggedReserveReg)
++      .addReg(AddrSetReserveReg)
++      .addImm(0);
++  BuildMI(MBB, MBBI, DL, TII->get(RISCV::CBuildCap), ReserveStackReg)
++      .addReg(ReserveStackReg)
++      .addReg(FinalUntaggedReserveReg);
++
++  MI.eraseFromParent();
++  return BB;
++}
++
+ MachineBasicBlock *
+ RISCVTargetLowering::EmitInstrWithCustomInserter(MachineInstr &MI,
+                                                  MachineBasicBlock *BB) const {
+@@ -10671,6 +10860,16 @@ RISCVTargetLowering::EmitInstrWithCustomInserter(MachineInstr &MI,
+     return emitQuietFCMP(MI, BB, RISCV::FLE_D, RISCV::FEQ_D, Subtarget);
+   case RISCV::PseudoQuietFLT_D:
+     return emitQuietFCMP(MI, BB, RISCV::FLT_D, RISCV::FEQ_D, Subtarget);
++  case RISCV::PseudoClearRegs:
++    return transformPseudoClearRegs(MI, BB, Subtarget);
++  case RISCV::PseudoUCCALL:
++    return emitPseudoUCCALL(MI, BB, Subtarget);
++  case RISCV::PseudoCShrinkStack:
++    return emitUninitShrinkStack(MI, BB, Subtarget);
++  case RISCV::PseudoCShrinkReserveStack:
++    return emitUninitShrinkReserveStack(MI, BB, Subtarget);
++  case RISCV::PseudoUninitStoreStackArgIntWithPad:
++    return emitUninitStoreStackArgs(MI, BB, Subtarget);
+   }
+ }
+ 
+@@ -11432,13 +11631,144 @@ static bool CC_RISCV_GHC(unsigned ValNo, MVT ValVT, MVT LocVT,
+   return true;
+ }
+ 
++BitVector GetCallReservedRegs(
++    const MachineFunction &MF,
++    const TargetRegisterInfo *TRI,
++    const SmallVectorImpl<CCValAssign> &ArgLocs) {
++  BitVector ReservedRegs = TRI->getReservedRegs(MF);
++  // Always preserve return address
++  TRI->markSuperRegs(ReservedRegs, RISCV::C1);
++
++  // Mark argument registers as reserved
++  for (const CCValAssign ArgLoc : ArgLocs) {
++    if (ArgLoc.isRegLoc()) {
++      TRI->markSuperRegs(ReservedRegs, ArgLoc.getLocReg());
++    }
++  }
++
++  return ReservedRegs;
++}
++
++SmallVector<SDValue,8> emitActivationRecordCode(SDValue Chain, SDLoc &DL, SelectionDAG &DAG, 
++                                 SDValue ActrecPtr, SmallVector<uint64_t, 3> ActrecCode) {
++  MVT DWVT = MVT::getIntegerVT(64);
++  SmallVector<SDValue,8> ReturnChains;
++  SDValue NextPtr = ActrecPtr;
++
++  for(auto *ActrecElem = ActrecCode.begin(); 
++      ActrecElem != ActrecCode.end(); ++ActrecElem){
++
++    SDValue ActrecConst = DAG.getConstant(*ActrecElem, DL, DWVT);
++    ReturnChains.push_back(DAG.getStore(Chain, DL, ActrecConst, NextPtr, MachinePointerInfo()));
++    if (ActrecElem + 1 != ActrecCode.end())
++      NextPtr = DAG.getPointerAdd(DL, NextPtr, 8);
++  }
++
++  return ReturnChains;
++}
++
++std::tuple<SDValue,SDValue,SDValue> emitActivationRecord(
++    SDValue Chain, SDLoc &DL, SelectionDAG &DAG, MachineFunction &MF,
++    EVT PtrVT, EVT XLenVT, bool HasFP, RISCVSubtarget::CHERIUninitEncapOpts Encap) 
++    {
++
++  // factor sizing information out of code below
++  unsigned PtrVTSize = PtrVT.getStoreSize();
++  Align PtrVTAlign = MF.getSubtarget<RISCVSubtarget>().getRegisterInfo()->getSpillAlign(RISCV::GPCRRegClass);
++
++  SmallVector<uint64_t, 3> ActrecCode = HasFP ? ActrecCodeFp : ActrecCodeNoFp;
++  unsigned ActrecCodeSize = ActrecCode.size() * 8;
++
++  unsigned ActrecSize = PtrVTSize * 2; // minimum size is stack cap and return cap
++  if (Encap == RISCVSubtarget::trampoline) ActrecSize += ActrecCodeSize;
++  if (HasFP) ActrecSize += PtrVTSize;
++  unsigned ActrecOffset;
++  switch(Encap) {
++    case RISCVSubtarget::trampoline:
++      ActrecOffset = ActrecSize - ActrecCodeSize;
++      break;
++    case RISCVSubtarget::isentry:
++      ActrecOffset = HasFP ? PtrVTSize : 0;
++      break;
++    default:
++      assert(false && "Incorrect option for return encapsulation!");
++      break;
++  }
++  
++  // create stack object and obtain pointer to it
++  int FI = MF.getFrameInfo().CreateStackObject(ActrecSize, PtrVTAlign, /*isSS*/ false);
++  SDValue ActrecPtr = DAG.getFrameIndex(FI, PtrVT);
++  
++  SDValue NextPtr = ActrecPtr;
++  SmallVector<SDValue, 8> ActrecStores;
++  
++  if (HasFP) { // store frame pointer if present
++    SDValue CFPReg = DAG.getRegister(RISCV::C8, PtrVT);
++    ActrecStores.push_back(DAG.getStore(Chain, DL, CFPReg, NextPtr, MachinePointerInfo(200)));
++    NextPtr = DAG.getPointerAdd(DL, NextPtr, PtrVTSize); // advance pointer
++  }
++
++  // emit return address
++  // create placeholder for return address, to be filled in later when node actually exists
++  // Get first forward directional label (which should be positioned right after the call)
++  MCSymbol *RLabel = MF.getMMI().getContext().createDirectionalLocalSymbol(1);
++  // setting this symbol to have xlenvt is stupid, but it is what the tablegen backend expects
++  // to fix, see definition of bare_symbol in RISCVInstrFormats.td
++  SDValue RAAddrSym = DAG.getMCSymbol(RLabel, XLenVT);
++  SDValue RAAddr = SDValue(DAG.getMachineNode(RISCV::PseudoCLLC, DL, PtrVT, RAAddrSym), 0);
++  ActrecStores.push_back(DAG.getStore(Chain, DL, RAAddr, NextPtr, MachinePointerInfo(), PtrVTAlign));
++  NextPtr = DAG.getPointerAdd(DL, NextPtr, PtrVTSize); // advance pointer
++
++  // emit stack capability store
++  SDValue CSPReg = DAG.getRegister(RISCV::C2, PtrVT);
++  ActrecStores.push_back(DAG.getStore(Chain, DL, CSPReg, NextPtr, MachinePointerInfo(200)));
++  NextPtr = DAG.getPointerAdd(DL, NextPtr, PtrVTSize); // advance pointer
++
++  if (Encap == RISCVSubtarget::trampoline)
++    ActrecStores.append(emitActivationRecordCode(Chain, DL, DAG, NextPtr, ActrecCode));
++
++  // Place bounds on the activation record capability
++  ActrecPtr = DAG.getNode(ISD::INTRINSIC_WO_CHAIN, DL, PtrVT, {
++      DAG.getTargetConstant(Intrinsic::cheri_bounded_stack_cap, DL, XLenVT)
++    , ActrecPtr
++    , DAG.getConstant(ActrecSize, DL, XLenVT)
++    });
++  // offset if necessary
++  if (ActrecOffset) ActrecPtr = DAG.getPointerAdd(DL, ActrecPtr, ActrecOffset);
++  // seal
++  auto SealingOp = (Encap == RISCVSubtarget::trampoline
++                 ? Intrinsic::cheri_cap_seal_entry
++                 : Intrinsic::cheri_cap_seal_indirect_pcc);
++  ActrecPtr = DAG.getNode(ISD::INTRINSIC_WO_CHAIN, DL, PtrVT, {
++    DAG.getTargetConstant(SealingOp, DL, XLenVT)
++  , ActrecPtr
++  });
++  SDValue OutChain = DAG.getNode(ISD::TokenFactor, DL, MVT::Other, ActrecStores);
++  return std::make_tuple(OutChain, ActrecPtr, RAAddrSym);
++}
++
++uint32_t CalculateCapClearMask(const BitVector CallReservedRegs)
++{
++  // Don't clear DDC, ever.
++  static const uint32_t CapBaseMask = 0xfffffffe;
++  uint32_t CapPreserveMask = 0;
++  for (Register Reg = RISCV::C1; Reg <= RISCV::C31; Reg = Reg + 1)
++  {
++    CapPreserveMask += ((uint32_t) CallReservedRegs.test(Reg)) << (Reg - RISCV::C0);
++  }
++
++  return CapBaseMask & ~CapPreserveMask;
++}
++
+ // Transform physical registers into virtual registers.
++// UNINITTODO: reserve register for uninit varargs here
+ SDValue RISCVTargetLowering::LowerFormalArguments(
+     SDValue Chain, CallingConv::ID CallConv, bool IsVarArg,
+     const SmallVectorImpl<ISD::InputArg> &Ins, const SDLoc &DL,
+     SelectionDAG &DAG, SmallVectorImpl<SDValue> &InVals) const {
+ 
+   MachineFunction &MF = DAG.getMachineFunction();
++  RISCVMachineFunctionInfo *RVFI = MF.getInfo<RISCVMachineFunctionInfo>();
+ 
+   switch (CallConv) {
+   default:
+@@ -11446,11 +11776,17 @@ SDValue RISCVTargetLowering::LowerFormalArguments(
+   case CallingConv::C:
+   case CallingConv::Fast:
+     break;
++  case CallingConv::CHERI_Uninit:
++    if (!RISCVABI::isCheriPureCapABI(Subtarget.getTargetABI()))
++      report_fatal_error(
++          "Uninitialised calling convention not defined on non-purecap targets");
++    break;
+   case CallingConv::GHC:
+     if (!MF.getSubtarget().getFeatureBits()[RISCV::FeatureStdExtF] ||
+-        !MF.getSubtarget().getFeatureBits()[RISCV::FeatureStdExtD])
++        !MF.getSubtarget().getFeatureBits()[RISCV::FeatureStdExtD]) {
+       report_fatal_error(
+         "GHC calling convention requires the F and D instruction set extensions");
++    }
+   }
+ 
+   const Function &Func = MF.getFunction();
+@@ -11476,6 +11812,7 @@ SDValue RISCVTargetLowering::LowerFormalArguments(
+   // Assign locations to all of the incoming arguments.
+   SmallVector<CCValAssign, 16> ArgLocs;
+   CCState CCInfo(CallConv, IsVarArg, MF, ArgLocs, *DAG.getContext());
++  MachineRegisterInfo &RegInfo = MF.getRegInfo();
+ 
+   if (CallConv == CallingConv::GHC)
+     CCInfo.AnalyzeFormalArguments(Ins, CC_RISCV_GHC);
+@@ -11524,19 +11861,24 @@ SDValue RISCVTargetLowering::LowerFormalArguments(
+   }
+ 
+   MachineFrameInfo &MFI = MF.getFrameInfo();
+-  RISCVMachineFunctionInfo *RVFI = MF.getInfo<RISCVMachineFunctionInfo>();
+   unsigned XLenInBytes = Subtarget.getXLen() / 8;
+   if (IsVarArg && RISCVABI::isCheriPureCapABI(Subtarget.getTargetABI())) {
+-    // Record the frame index of the first variable argument
+-    // which is a value necessary to VASTART.
+-    int FI = MFI.CreateFixedObject(XLenInBytes, CCInfo.getNextStackOffset(),
+-                                   true);
+-    RVFI->setVarArgsFrameIndex(FI);
++    if (IsVarArg && (Subtarget.hasUninitStack() || Subtarget.hasReserveStack())) {
++      Register StackPassedArgRegister = RVFI->getStackPassedArgRegister();
++      DAG.getRegister(StackPassedArgRegister, PtrVT);
++      CCInfo.AllocateReg(StackPassedArgRegister);
++      RegInfo.addLiveIn(StackPassedArgRegister);
++    } else {
++      // Record the frame index of the first variable argument
++      // which is a value necessary to VASTART.
++      int FI = MFI.CreateFixedObject(XLenInBytes, CCInfo.getNextStackOffset(),
++                                    true);
++      RVFI->setVarArgsFrameIndex(FI);
++    }
+   } else if (IsVarArg) {
+     ArrayRef<MCPhysReg> ArgRegs = makeArrayRef(ArgGPRs);
+     unsigned Idx = CCInfo.getFirstUnallocated(ArgRegs);
+     const TargetRegisterClass *RC = &RISCV::GPRRegClass;
+-    MachineRegisterInfo &RegInfo = MF.getRegInfo();
+ 
+     // Offset of the first variable argument from stack pointer, and size of
+     // the vararg save area. For now, the varargs save area is either zero or
+@@ -11673,6 +12015,34 @@ static Align getPrefTypeAlign(EVT VT, SelectionDAG &DAG) {
+       VT.getTypeForEVT(*DAG.getContext()));
+ }
+ 
++static SDValue EmitIncrementSecureCallInstrumentation(MachineFunction &MF, SelectionDAG &DAG, SDLoc &DL, EVT PtrVT, SDValue Chain) {
++  Module *M = MF.getFunction().getParent();
++  EVT ValVT = MVT::i64;
++
++  GlobalVariable *GV = dyn_cast_or_null<GlobalVariable>(
++    M->getNamedGlobal("_uninit_call_count"));
++
++  if (!GV) {
++    GV = new GlobalVariable(
++        *M,
++        Type::getInt64Ty(M->getContext()),   // type
++        false,                    // isConstant
++        GlobalValue::ExternalLinkage,
++        nullptr,                  // no initializer = external declaration
++        "_uninit_call_count");
++  }
++
++  SDValue Ptr = DAG.getGlobalAddress(GV, DL, PtrVT);
++  SDValue Load = DAG.getLoad(ValVT, DL, Chain, Ptr,
++                             MachinePointerInfo(GV));
++  SDValue One = DAG.getConstant(1, DL, ValVT);
++  SDValue Add = DAG.getNode(ISD::ADD, DL, ValVT, Load, One);
++  SDValue Store = DAG.getStore(Load.getValue(1), DL, Add, Ptr,
++                               MachinePointerInfo(GV));
++
++  return Store;
++}
++
+ // Lower a call to a callseq_start + CALL + callseq_end chain, and add input
+ // and output parameter nodes.
+ SDValue RISCVTargetLowering::LowerCall(CallLoweringInfo &CLI,
+@@ -11689,17 +12059,25 @@ SDValue RISCVTargetLowering::LowerCall(CallLoweringInfo &CLI,
+   bool IsVarArg = CLI.IsVarArg;
+   // TODO-CHERI: Stack address space (and uses)
+   EVT PtrVT = getPointerTy(DAG.getDataLayout(),
+-                           DAG.getDataLayout().getAllocaAddrSpace());
++  DAG.getDataLayout().getAllocaAddrSpace());
+   MVT XLenVT = Subtarget.getXLenVT();
+-
++  
+   MachineFunction &MF = DAG.getMachineFunction();
++  bool hasFramePointer = RISCVGenRegisterInfo::getFrameLowering(MF)->hasFP(MF);
++  RISCVSubtarget::CHERIUninitEncapOpts CHERIUninitEncap = Subtarget.getCHERIUninitEncap();
++  RISCVMachineFunctionInfo *RVFI = MF.getInfo<RISCVMachineFunctionInfo>();
+ 
+   // Analyze the operands of the call, assigning locations to each operand.
+   SmallVector<CCValAssign, 16> ArgLocs;
+   CCState ArgCCInfo(CallConv, IsVarArg, MF, ArgLocs, *DAG.getContext());
++  if (IsVarArg && (Subtarget.hasUninitStack() || Subtarget.hasReserveStack())) {
++    ArgCCInfo.AllocateReg(RVFI->getStackPassedArgRegister());
++  }
+ 
+   if (CallConv == CallingConv::GHC)
+     ArgCCInfo.AnalyzeCallOperands(Outs, CC_RISCV_GHC);
++  else if (CallConv == CallingConv::CHERI_Uninit)
++    analyzeOutputArgs(MF, ArgCCInfo, Outs, /*IsRet=*/false, &CLI, CC_RISCV);
+   else
+     analyzeOutputArgs(MF, ArgCCInfo, Outs, /*IsRet=*/false, &CLI,
+                       CallConv == CallingConv::Fast ? CC_RISCV_FastCC
+@@ -11745,10 +12123,28 @@ SDValue RISCVTargetLowering::LowerCall(CallLoweringInfo &CLI,
+   if (!IsTailCall)
+     Chain = DAG.getCALLSEQ_START(Chain, NumBytes, 0, CLI.DL);
+ 
++  SDValue ReserveStackSpillSlot = SDValue();
++  std::tuple<SDValue, SDValue, SDValue> ActrecNodes;
++  if(CHERIUninitEncap != RISCVSubtarget::none) {
++    // Emit activation record onto the stack
++    if (CallConv == CallingConv::CHERI_Uninit) {
++      ActrecNodes = emitActivationRecord(Chain, DL, DAG, MF, PtrVT, XLenVT, hasFramePointer, CHERIUninitEncap);
++      Chain = std::get<0>(ActrecNodes);
++
++      if (Subtarget.hasReserveStack()) {
++        ReserveStackSpillSlot = DAG.getFrameIndex(
++          MF.getFrameInfo().CreateSpillStackObject(PtrVT.getStoreSize(), getPrefTypeAlign(PtrVT, DAG)), PtrVT);
++        Chain = DAG.getStore(Chain, DL, DAG.getRegister(RISCV::C31, PtrVT), ReserveStackSpillSlot, MachinePointerInfo(200));
++        Chain = DAG.getNode(RISCVISD::CAP_SHRINK_RESERVE_STACK, DL, MVT::Other, Chain);
++      }
++    }
++  }
++
+   // Copy argument values to their designated locations.
+   SmallVector<std::pair<Register, SDValue>, 8> RegsToPass;
+   SmallVector<SDValue, 8> MemOpChains;
+   SDValue StackPtr;
++  uint64_t StackPassedArgStructSize = 0;
+   for (unsigned i = 0, j = 0, e = ArgLocs.size(); i != e; ++i) {
+     CCValAssign &VA = ArgLocs[i];
+     SDValue ArgValue = OutVals[i];
+@@ -11857,8 +12253,11 @@ SDValue RISCVTargetLowering::LowerCall(CallLoweringInfo &CLI,
+             DAG.getCopyFromReg(Chain, DL,
+                                getStackPointerRegisterToSaveRestore(),
+                                PtrVT);
++
+       SDValue Address =
+           DAG.getPointerAdd(DL, StackPtr, VA.getLocMemOffset());
++      if (VA.getLocMemOffset() > StackPassedArgStructSize) 
++        StackPassedArgStructSize = VA.getLocMemOffset();
+ 
+       // Emit the store.
+       MemOpChains.push_back(
+@@ -11866,12 +12265,42 @@ SDValue RISCVTargetLowering::LowerCall(CallLoweringInfo &CLI,
+     }
+   }
+ 
++  if (IsVarArg && (Subtarget.hasUninitStack() || Subtarget.hasReserveStack())) {
++    if (!StackPtr.getNode())
++      StackPtr = DAG.getCopyFromReg(
++          Chain, DL, getStackPointerRegisterToSaveRestore(), PtrVT);
++
++    // align to 16 byte boundary
++    StackPassedArgStructSize += 16 - (StackPassedArgStructSize % 16);
++    SDValue StackPassedArgStructPtr = DAG.getNode(ISD::INTRINSIC_WO_CHAIN, DL, PtrVT, {
++      DAG.getTargetConstant(Intrinsic::cheri_bounded_stack_cap, DL, XLenVT)
++    , StackPtr
++    , DAG.getConstant(StackPassedArgStructSize, DL, XLenVT)
++    });
++    RegsToPass.push_back(std::make_pair(
++      RVFI->getStackPassedArgRegister(),
++      StackPassedArgStructPtr
++    ));
++  }
++
+   // Join the stores, which are independent of one another.
+   if (!MemOpChains.empty())
+     Chain = DAG.getNode(ISD::TokenFactor, DL, MVT::Other, MemOpChains);
+ 
++  if (CallConv == CallingConv::CHERI_Uninit && CHERIInstrumentSecureCalls)
++    Chain = EmitIncrementSecureCallInstrumentation(MF, DAG, DL, PtrVT, Chain);
++
+   SDValue Glue;
+ 
++  if (CallConv == CallingConv::CHERI_Uninit
++  && (CHERIUninitEncap == RISCVSubtarget::trampoline 
++   || CHERIUninitEncap == RISCVSubtarget::isentry)) {
++    // install activation record code as return address
++    SDValue ActrecPtr = std::get<1>(ActrecNodes);
++    Chain = DAG.getCopyToReg(Chain, DL, RISCV::C1, ActrecPtr, Glue);
++    Glue = Chain.getValue(1);
++  }
++
+   // Build a sequence of copy-to-reg nodes, chained and glued together.
+   for (auto &Reg : RegsToPass) {
+     Chain = DAG.getCopyToReg(Chain, DL, Reg.first, Reg.second, Glue);
+@@ -11932,11 +12361,41 @@ SDValue RISCVTargetLowering::LowerCall(CallLoweringInfo &CLI,
+       Callee = DAG.getTargetExternalFunctionSymbol(S->getSymbol(), OpFlags);
+   }
+ 
++  const RISCVRegisterInfo *TRI = Subtarget.getRegisterInfo();
++  // Emit register clearing node
++  if(TRI->requiresRegisterClearing() && CallConv == CallingConv::CHERI_Uninit) {
++    SmallVector<SDValue, 8> Ops;
++    uint32_t ClearMask = CalculateCapClearMask(GetCallReservedRegs(MF, TRI, ArgLocs));
++    Ops.push_back(Chain);
++    Ops.push_back(DAG.getConstant(ClearMask, DL, MVT::i64));
++    if (Glue.getNode()) Ops.push_back(Glue);
++    SDVTList NodeTys = DAG.getVTList(MVT::Other, MVT::Glue);
++    Chain = DAG.getNode(RISCVISD::CLEAR_REGS, DL, NodeTys, Ops);
++    Glue = Chain.getValue(1);
++  }
++
++    // Emit stack cap shrinking node
++  if (CallConv == CallingConv::CHERI_Uninit && CHERIUninitStackSplit) {
++    Chain = DAG.getNode(RISCVISD::CAP_SHRINK_STACK, DL, {MVT::Other, MVT::Glue}, {
++      Chain
++    , DAG.getConstant(0, DL, XLenVT)
++    , Glue
++    });
++    Glue = Chain.getValue(1);
++  }
++
+   // The first call operand is the chain and the second is the target address.
+   SmallVector<SDValue, 8> Ops;
+   Ops.push_back(Chain);
+   Ops.push_back(Callee);
+ 
++  // Add return symbol to the arguments
++  if (CallConv == CallingConv::CHERI_Uninit
++  && (CHERIUninitEncap == RISCVSubtarget::trampoline 
++   || CHERIUninitEncap == RISCVSubtarget::isentry)) {
++    Ops.push_back(std::get<2>(ActrecNodes));
++  }
++
+   // Add argument registers to the end of the list so that they are
+   // known live into the call.
+   for (auto &Reg : RegsToPass)
+@@ -11944,7 +12403,6 @@ SDValue RISCVTargetLowering::LowerCall(CallLoweringInfo &CLI,
+ 
+   if (!IsTailCall) {
+     // Add a register mask operand representing the call-preserved registers.
+-    const TargetRegisterInfo *TRI = Subtarget.getRegisterInfo();
+     const uint32_t *Mask = TRI->getCallPreservedMask(MF, CallConv);
+     assert(Mask && "Missing call preserved mask for calling convention");
+     Ops.push_back(DAG.getRegisterMask(Mask));
+@@ -11959,15 +12417,21 @@ SDValue RISCVTargetLowering::LowerCall(CallLoweringInfo &CLI,
+ 
+   if (IsTailCall) {
+     MF.getFrameInfo().setHasTailCall();
++    assert(CallConv != CallingConv::CHERI_Uninit && "Uninit tail calls not supported!");
+     if (RISCVABI::isCheriPureCapABI(Subtarget.getTargetABI()))
+       return DAG.getNode(RISCVISD::CAP_TAIL, DL, NodeTys, Ops);
+     else
+       return DAG.getNode(RISCVISD::TAIL, DL, NodeTys, Ops);
+   }
+ 
+-  if (RISCVABI::isCheriPureCapABI(Subtarget.getTargetABI()))
+-    Chain = DAG.getNode(RISCVISD::CAP_CALL, DL, NodeTys, Ops);
+-  else
++  if (RISCVABI::isCheriPureCapABI(Subtarget.getTargetABI())) {
++    if (CallConv == CallingConv::CHERI_Uninit
++    && (CHERIUninitEncap == RISCVSubtarget::trampoline 
++     || CHERIUninitEncap == RISCVSubtarget::isentry)) {
++        Chain = DAG.getNode(RISCVISD::UNINIT_CALL, DL, NodeTys, Ops);
++    } else
++      Chain = DAG.getNode(RISCVISD::CAP_CALL, DL, NodeTys, Ops);
++  } else
+     Chain = DAG.getNode(RISCVISD::CALL, DL, NodeTys, Ops);
+ 
+   DAG.addNoMergeSiteInfo(Chain.getNode(), CLI.NoMerge);
+@@ -12009,6 +12473,14 @@ SDValue RISCVTargetLowering::LowerCall(CallLoweringInfo &CLI,
+     InVals.push_back(RetValue);
+   }
+ 
++  if(ReserveStackSpillSlot.getNode()) {
++    SDValue SpilledReserveStackReg = DAG.getLoad(
++        PtrVT, DL, Chain, ReserveStackSpillSlot, MachinePointerInfo());
++    Chain = SpilledReserveStackReg.getValue(1);
++    Chain =
++        DAG.getCopyToReg(Chain, DL, RISCV::C31, SpilledReserveStackReg);
++  }
++
+   return Chain;
+ }
+ 
+@@ -12042,6 +12514,7 @@ RISCVTargetLowering::LowerReturn(SDValue Chain, CallingConv::ID CallConv,
+                                  const SDLoc &DL, SelectionDAG &DAG) const {
+   const MachineFunction &MF = DAG.getMachineFunction();
+   const RISCVSubtarget &STI = MF.getSubtarget<RISCVSubtarget>();
++  RISCVSubtarget::CHERIUninitEncapOpts CHERIUninitEncap = STI.getCHERIUninitEncap();
+ 
+   // Stores the assignment of the return value to a location.
+   SmallVector<CCValAssign, 16> RVLocs;
+@@ -12104,6 +12577,19 @@ RISCVTargetLowering::LowerReturn(SDValue Chain, CallingConv::ID CallConv,
+     }
+   }
+ 
++  const RISCVRegisterInfo *TRI = Subtarget.getRegisterInfo();
++  // Emit register clearing node
++  if(TRI->requiresRegisterClearing() && CallConv == CallingConv::CHERI_Uninit) {
++    SmallVector<SDValue, 3> CROps;
++    uint32_t ClearMask = CalculateCapClearMask(GetCallReservedRegs(MF, TRI, RVLocs));
++    CROps.push_back(Chain);
++    CROps.push_back(DAG.getConstant(ClearMask, DL, MVT::i64));
++    if (Glue.getNode()) CROps.push_back(Glue);
++    SDVTList CRNodeTys = DAG.getVTList(MVT::Other, MVT::Glue);
++    Chain = DAG.getNode(RISCVISD::CLEAR_REGS, DL, CRNodeTys, CROps);
++    Glue = Chain.getValue(1);
++  }
++
+   RetOps[0] = Chain; // Update chain.
+ 
+   // Add the glue node if we have it.
+@@ -12112,6 +12598,12 @@ RISCVTargetLowering::LowerReturn(SDValue Chain, CallingConv::ID CallConv,
+   }
+ 
+   unsigned RetOpc = RISCVISD::RET_FLAG;
++
++  // returning with an indirect sentry requires CInvokeLAL instead of CRet
++  if (CallConv == CallingConv::CHERI_Uninit && CHERIUninitEncap == RISCVSubtarget::isentry) {
++    RetOpc = RISCVISD::RET_FLAG_INDIRECT;
++  }
++
+   // Interrupt service routines use different return instructions.
+   const Function &Func = DAG.getMachineFunction().getFunction();
+   if (Func.hasFnAttribute("interrupt")) {
+@@ -12324,6 +12816,12 @@ const char *RISCVTargetLowering::getTargetNodeName(unsigned Opcode) const {
+   NODE_NAME_CASE(READ_CSR)
+   NODE_NAME_CASE(WRITE_CSR)
+   NODE_NAME_CASE(SWAP_CSR)
++  NODE_NAME_CASE(CLEAR_REGS)
++  NODE_NAME_CASE(CAP_SHRINK_STACK)
++  NODE_NAME_CASE(CAP_SHRINK_RESERVE_STACK)
++  NODE_NAME_CASE(UNINIT_CALL)
++  NODE_NAME_CASE(RET_FLAG_INDIRECT)
++  NODE_NAME_CASE(UNINIT_STORE_STACK_ARG)
+   }
+   // clang-format on
+   return nullptr;
+diff --git a/llvm/lib/Target/RISCV/RISCVISelLowering.h b/llvm/lib/Target/RISCV/RISCVISelLowering.h
+index a36c89d59681..c4caf879b27d 100644
+--- a/llvm/lib/Target/RISCV/RISCVISelLowering.h
++++ b/llvm/lib/Target/RISCV/RISCVISelLowering.h
+@@ -121,6 +121,7 @@ enum NodeType : unsigned {
+   READ_CYCLE_WIDE,
+   CAP_CALL,
+   CAP_TAIL,
++  UNINIT_CALL,
+   /// Legalised int_cheri_cap_tag_get
+   CAP_TAG_GET,
+   /// Legalised int_cheri_cap_sealed_get
+@@ -341,6 +342,17 @@ enum NodeType : unsigned {
+   // result being sign extended to 64 bit. These saturate out of range inputs.
+   STRICT_FCVT_W_RV64 = ISD::FIRST_TARGET_STRICTFP_OPCODE,
+   STRICT_FCVT_WU_RV64,
++  
++  // Clear multiple registers using a bitmask
++  CLEAR_REGS,
++  // Shrink the stack cap
++  CAP_SHRINK_STACK,
++  // Shrink the reserve stack cap
++  CAP_SHRINK_RESERVE_STACK,
++  // Return with CInvokeLAL instead of cret
++  RET_FLAG_INDIRECT,
++  // Store a value to the uninit stack
++  UNINIT_STORE_STACK_ARG,
+ 
+   // WARNING: Do not add anything in the end unless you want the node to
+   // have memop! In fact, starting from FIRST_TARGET_MEMORY_OPCODE all
+diff --git a/llvm/lib/Target/RISCV/RISCVInstrFormatsXCheri.td b/llvm/lib/Target/RISCV/RISCVInstrFormatsXCheri.td
+index 5149d18bf6dc..cb6073b1acba 100644
+--- a/llvm/lib/Target/RISCV/RISCVInstrFormatsXCheri.td
++++ b/llvm/lib/Target/RISCV/RISCVInstrFormatsXCheri.td
+@@ -24,6 +24,11 @@ def uimm12 : Operand<XLenVT>, ImmLeaf<XLenVT, [{return isUInt<12>(Imm);}]> {
+   let DecoderMethod = "decodeUImmOperand<12>";
+ }
+ 
++def uimm32 : Operand<XLenVT>, ImmLeaf<XLenVT, [{return isUInt<32>(Imm);}]> {
++  let ParserMatchClass = UImmAsmOperand<32>;
++  let DecoderMethod = "decodeUImmOperand<32>";
++}
++
+ def SpecialCapRegisterAsmOperand : AsmOperandClass {
+   let Name = "SpecialCapRegister";
+   let ParserMethod = "parseSpecialCapRegister";
+diff --git a/llvm/lib/Target/RISCV/RISCVInstrInfoXCheri.td b/llvm/lib/Target/RISCV/RISCVInstrInfoXCheri.td
+index 63ee0b4f6b09..4a2d47d757a6 100644
+--- a/llvm/lib/Target/RISCV/RISCVInstrInfoXCheri.td
++++ b/llvm/lib/Target/RISCV/RISCVInstrInfoXCheri.td
+@@ -28,6 +28,11 @@ def riscv_cap_call        : SDNode<"RISCVISD::CAP_CALL", SDT_RISCVCapCall,
+ def riscv_cap_tail        : SDNode<"RISCVISD::CAP_TAIL", SDT_RISCVCapCall,
+                                    [SDNPHasChain, SDNPOptInGlue, SDNPOutGlue,
+                                     SDNPVariadic]>;
++def riscv_uninit_call     : SDNode<"RISCVISD::UNINIT_CALL", SDT_RISCVCapCall,
++                                   [SDNPHasChain, SDNPOptInGlue, SDNPOutGlue,
++                                    SDNPVariadic]>;
++def riscv_ret_flag_indirect : SDNode<"RISCVISD::RET_FLAG_INDIRECT", SDTNone,
++                                   [SDNPHasChain, SDNPOptInGlue, SDNPVariadic]>;
+ def riscv_cap_tag_get     : SDNode<"RISCVISD::CAP_TAG_GET",
+                                    SDT_RISCVCheriBoolUnary>;
+ def riscv_cap_sealed_get  : SDNode<"RISCVISD::CAP_SEALED_GET",
+@@ -181,6 +186,13 @@ class CheriStoreCond_r<bits<5> op, string opcodestr, RegisterClass rs2Class,
+                         (ins rs2Class:$rs2, rs1Operand:$rs1),
+                         opcodestr, "$rs2, $rs1">;
+ 
++let hasSideEffects = 0, mayLoad = 0, mayStore = 1 in
++class CheriStoreUninit_rr<bits<7> op, string opcodestr, RegisterClass rs2Class = GPR>
++    : RVInstR<op, 0b000, OPC_CHERI,
++               (outs GPCR:$rd),
++               (ins rs2Class:$rs2, GPCR:$rs1),
++               opcodestr, "$rd, $rs2, $rs1">;
++
+ let hasSideEffects = 0, mayLoad = 1, mayStore = 0 in
+ class LR_C_r<bit aq, bit rl, bits<3> funct3, string opcodestr>
+     : RVInstRAtomic<0b00010, aq, rl, funct3, OPC_AMO,
+@@ -324,16 +336,28 @@ def CGetSealed : Cheri_r<0x5, "cgetsealed">;
+ def CGetOffset : Cheri_r<0x6, "cgetoffset">;
+ def CGetFlags  : Cheri_r<0x7, "cgetflags">;
+ def CGetHigh   : Cheri_r<0x17, "cgethigh">;
++def CGetTop    : Cheri_r<0x18, "cgettop">;
+ // For backwards compatibility we still accept cgetaddr from assembly.
+ let mayStore = false, mayLoad = false, Size = 4, isCodeGenOnly = false in
+ def PseudoCGetAddr : Pseudo<(outs GPR:$rd), (ins GPCR:$cs1), [],
+                             "cgetaddr", "$rd, $cs1">;
+ }
+ 
++let Predicates = [HasCheri,IsRV64] in {
++def CGetUninit : Cheri_r<0x1b, "cgetuninit">;
++}
++
+ //===----------------------------------------------------------------------===//
+ // Capability-Modification Instructions
+ //===----------------------------------------------------------------------===//
+ 
++def SDT_RISCVCheriVoidUnary : SDTypeProfile<0, 1, [SDTCisInt<0>]>;
++def riscv_cap_shrink_stack : SDNode<"RISCVISD::CAP_SHRINK_STACK", SDT_RISCVCheriVoidUnary,
++                                    [SDNPHasChain, SDNPOptInGlue, SDNPOutGlue]>;
++
++def riscv_cap_shrink_reserve_stack : SDNode<"RISCVISD::CAP_SHRINK_RESERVE_STACK", SDTypeProfile<0,0,[]>,
++                                    [SDNPHasChain]>;
++
+ let Predicates = [HasCheri] in {
+ let Constraints = "@traps_if_sealed $rs1" in {
+ let mayTrap = 1 in {
+@@ -364,14 +388,36 @@ def CBuildCap       : Cheri_rr<0x1d, "cbuildcap", GPCR, GPCR, GPCRC0IsDDC>;
+ def CCopyType       : Cheri_rr<0x1e, "ccopytype", GPCR, GPCR>;
+ let defsCanBeSealed = 1 in
+ def CCSeal          : Cheri_rr<0x1f, "ccseal", GPCR, GPCR>;
+-let defsCanBeSealed = 1 in
++let defsCanBeSealed = 1 in {
+ def CSealEntry      : Cheri_r<0x11, "csealentry", GPCR>;
++def CSealL          : Cheri_r<0x19, "cseall", GPCR>;
++}
+ } // let mayTrap = 1
+ 
++let Predicates = [HasCheri, IsRV64] in {
++def CUninit     : Cheri_r<0x1c, "cuninit", GPCR>;
++def CDropUninit : Cheri_r<0x1d, "cdropuninit", GPCR>;
++def CShrink     : Cheri_rr<0x22, "cshrink">;
++def CShrinkImm  : Cheri_ri<0x3, "cshrink", 0>;
++def CSplice     : Cheri_rr<0x23, "csplice", GPCR, GPCR, GPCR>;
++
++let hasSideEffects = 1, mayLoad = 0, mayStore = 0, hasCtrlDep = 1, Uses = [C2], Defs = [C2], usesCustomInserter = 1 in
++def PseudoCShrinkStack : Pseudo<(outs), (ins uimm12:$imm), [(riscv_cap_shrink_stack uimm12:$imm)]>;
++
++let hasSideEffects = 1, mayLoad = 0, mayStore = 0, hasCtrlDep = 1, Uses = [C2,C31], Defs = [C31], usesCustomInserter = 1 in
++def PseudoCShrinkReserveStack : Pseudo<(outs), (ins), [(riscv_cap_shrink_reserve_stack)]>;
++
++let hasSideEffects = 0, mayLoad = 0, mayStore = 1, isBranch = 1, Uses = [C1,C2], Defs = [C2], usesCustomInserter = 1 in
++def PseudoConditionalReplenishReserveStack : Pseudo<(outs), (ins GPR:$thr, GPR:$sts), []>;
++
++}
++
+ def : InstAlias<"cincoffsetimm $cd, $cs1, $imm",
+                 (CIncOffsetImm GPCR:$cd, GPCR:$cs1, simm12:$imm), 0>;
+ def : InstAlias<"csetboundsimm $cd, $cs1, $imm",
+                 (CSetBoundsImm GPCR:$cd, GPCR:$cs1, uimm12:$imm), 0>;
++def : InstAlias<"cshrinkimm $cd, $cs1, $imm",
++                (CShrinkImm GPCR:$cd, GPCR:$cs1, uimm12:$imm), 0>;
+ }
+ 
+ //===----------------------------------------------------------------------===//
+@@ -410,6 +456,9 @@ def CInvoke : RVInstCheriTwoSrc<0x7e, 0x1, 0, OPC_CHERI, (outs),
+                                 (ins GPCR:$rs1, GPCR:$rs2),
+                                 "cinvoke", "$rs1, $rs2">;
+ 
++let isCall = 1, hasSideEffects = 0, mayLoad = 1, mayStore = 0 in
++def CInvokeLAL : Cheri_r<0x1a, "cinvokelal", GPCR>;
++
+ def : InstAlias<"jalr.cap $cs1", (JALR_CAP C1, GPCR:$cs1), 1>;
+ def : InstAlias<"jr.cap $cs1",   (JALR_CAP C0, GPCR:$cs1), 1>;
+ def : InstAlias<"ret.cap",       (JALR_CAP C0,        C1), 2>;
+@@ -451,6 +500,7 @@ def : InstAlias<"cspecialw $scr, $cs",
+ //===----------------------------------------------------------------------===//
+ 
+ let Predicates = [HasCheri], hasSideEffects = 1 in {
++def Clear   : Cheri_clear<0xd, "clear">;
+ def CClear  : Cheri_clear<0xe, "cclear">;
+ def FPClear : Cheri_clear<0x10, "fpclear">;
+ }
+@@ -616,6 +666,14 @@ def SC_C_CAP_64  : CheriStoreCond_r<0b11011, "sc.c.cap", GPCR, GPCRMemZeroOffset
+ let Predicates = [HasCheri, HasStdExtA, IsRV64] in
+ def SC_C_CAP_128 : CheriStoreCond_r<0b11100, "sc.c.cap", GPCR, GPCRMemZeroOffset>;
+ 
++let Predicates = [HasCheri, IsRV64] in {
++def USB_CAP : CheriStoreUninit_rr<0b1110111, "usb">;
++def USH_CAP : CheriStoreUninit_rr<0b1111000, "ush">;
++def USW_CAP : CheriStoreUninit_rr<0b1111001, "usw">;
++def USD_CAP : CheriStoreUninit_rr<0b1111010, "usd">;
++def USC_CAP : CheriStoreUninit_rr<0b1111011, "usc", GPCR>;
++}
++
+ //===----------------------------------------------------------------------===//
+ // Memory-Access Instructions
+ //===----------------------------------------------------------------------===//
+@@ -1106,6 +1164,45 @@ def : InstAlias<"c.cincoffsetimm16csp $rd, $imm",
+ // Pseudo-instructions and codegen patterns
+ //===----------------------------------------------------------------------===//
+ 
++
++def SDT_RISCVClearRegs : SDTypeProfile<0, 1, []>;
++def riscv_clear_regs : SDNode<"RISCVISD::CLEAR_REGS", SDT_RISCVClearRegs,
++[SDNPHasChain, SDNPOptInGlue, SDNPOutGlue]>;
++
++let Predicates = [HasCheri, IsCapMode], hasSideEffects = 1 in {
++let usesCustomInserter = 1 in
++def PseudoClearRegs : Pseudo<(outs), (ins uimm32:$mask), [(riscv_clear_regs uimm32:$mask)]>;
++
++let mayLoad = 0, mayStore = 0 in
++def PseudoCClear : Pseudo<(outs), (ins uimm2:$quad, uimm8:$mask), []>,
++  PseudoInstExpansion<(CClear uimm2:$quad, uimm8:$mask)>;
++}
++
++
++def SDT_RISCVUninitStoreStackArg : SDTypeProfile<0, 3, [SDTCisInt<1>, SDTCisInt<2>]>;
++def riscv_uninit_store_stack_arg : SDNode<"RISCVISD::UNINIT_STORE_STACK_ARG", SDT_RISCVUninitStoreStackArg, [SDNPHasChain, SDNPMayStore, SDNPOptInGlue, SDNPOutGlue]>;
++
++let Predicates = [HasCheri, IsCapMode], hasSideEffects = 1, mayLoad = 0, mayStore = 1 in { 
++def PseudoUninitStoreStackArgIntB : Pseudo<(outs), (ins GPR:$arg), 
++                                           [(riscv_uninit_store_stack_arg GPR:$arg, (i64 1), (i64 0))]>,
++                                           PseudoInstExpansion<(USB_CAP C2, GPR:$arg, C2)>;
++def PseudoUninitStoreStackArgIntH : Pseudo<(outs), (ins GPR:$arg), 
++                                           [(riscv_uninit_store_stack_arg GPR:$arg, (i64 2), (i64 0))]>,
++                                           PseudoInstExpansion<(USH_CAP C2, GPR:$arg, C2)>;
++def PseudoUninitStoreStackArgIntW : Pseudo<(outs), (ins GPR:$arg), 
++                                           [(riscv_uninit_store_stack_arg GPR:$arg, (i64 4), (i64 0))]>,
++                                           PseudoInstExpansion<(USW_CAP C2, GPR:$arg, C2)>;
++def PseudoUninitStoreStackArgIntD : Pseudo<(outs), (ins GPR:$arg), 
++                                           [(riscv_uninit_store_stack_arg GPR:$arg, (i64 8), (i64 0))]>,
++                                           PseudoInstExpansion<(USD_CAP C2, GPR:$arg, C2)>;
++let usesCustomInserter = 1 in
++def PseudoUninitStoreStackArgIntWithPad : Pseudo<(outs), (ins GPR:$arg, uimm12:$size, uimm12:$pad), 
++  [(riscv_uninit_store_stack_arg GPR:$arg, uimm12:$size, uimm12:$pad)]>;
++def PseudoUninitStoreStackArgCap : Pseudo<(outs), (ins GPCR:$arg), 
++                                   [(riscv_uninit_store_stack_arg GPCR:$arg, (i64 16), (i64 0))]>,
++                                   PseudoInstExpansion<(USC_CAP C2, GPCR:$arg, C2)>;
++}
++
+ let Predicates = [HasCheri, IsCapMode] in {
+ let hasSideEffects = 0, mayLoad = 0, mayStore = 0, isCodeGenOnly = 0,
+     isAsmParserOnly = 1, Size = 8 in
+@@ -1218,6 +1315,7 @@ def : PatGpcrGpcr<int_cheri_cap_build, CBuildCap>;
+ def : PatGpcrGpcr<int_cheri_cap_type_copy, CCopyType>;
+ def : PatGpcrGpcr<int_cheri_cap_conditional_seal, CCSeal>;
+ def : PatGpcr<int_cheri_cap_seal_entry, CSealEntry>;
++def : PatGpcr<int_cheri_cap_seal_indirect_pcc, CSealL>;
+ 
+ // TODO: Make this rematerialisable like MIPS
+ def : PatGpcrGpr<int_cheri_bounded_stack_cap, CSetBounds>;
+@@ -1225,6 +1323,9 @@ def : PatGpcrUimm12<int_cheri_bounded_stack_cap, CSetBoundsImm>;
+ def : PatGpcrGpr<int_cheri_bounded_stack_cap_dynamic, CSetBounds>;
+ def : PatGpcrUimm12<int_cheri_bounded_stack_cap_dynamic, CSetBoundsImm>;
+ 
++def : PatGpcrGpr<int_cheri_shrink_cap, CShrink>;
++def : PatGpcrUimm12<int_cheri_shrink_cap, CShrinkImm>;
++
+ def : Pat<(CapFrameAddrRegImm GPCR:$rs1, simm12:$imm12),
+           (CIncOffsetImm GPCR:$rs1, simm12:$imm12)>;
+ 
+@@ -1799,11 +1900,26 @@ def PseudoCCALLIndirect : Pseudo<(outs), (ins GPCR:$rs1),
+                                  [(riscv_cap_call GPCR:$rs1)]>,
+                           PseudoInstExpansion<(CJALR C1, GPCR:$rs1, 0)>;
+ 
++let Predicates = [HasCheri, IsCapMode, IsPureCapABI] in {
++let isCall = 1, Uses = [C1], usesCustomInserter = 1 in
++def PseudoUCCALL : Pseudo<(outs), (ins cap_call_symbol:$func, bare_symbol:$ra), []>;
++def : Pat<(riscv_uninit_call tglobaladdr:$func, XLenVT:$ra),
++          (PseudoUCCALL tglobaladdr:$func, bare_symbol:$ra)>;
++def : Pat<(riscv_uninit_call texternalsym:$func, XLenVT:$ra),
++          (PseudoUCCALL texternalsym:$func, bare_symbol:$ra)>;
++} // Predicates = [HasCheri, IsCapMode, IsPureCapABI]
++
++
+ let Predicates = [HasCheri, IsCapMode, IsPureCapABI],
+     isBarrier = 1, isReturn = 1, isTerminator = 1 in
+ def PseudoCRET : Pseudo<(outs), (ins), [(riscv_ret_flag)]>,
+                  PseudoInstExpansion<(CJALR C0, C1, 0)>;
+ 
++let Predicates = [HasCheri, IsCapMode, IsPureCapABI],
++    isBarrier = 1, isReturn = 1, isTerminator = 1, mayLoad = 1 in
++def PseudoCRETIndirect : Pseudo<(outs), (ins), [(riscv_ret_flag_indirect)]>,
++                         PseudoInstExpansion<(CInvokeLAL C0, C1)>;
++
+ let Predicates = [HasCheri, IsCapMode],
+     isCall = 1, isTerminator = 1, isReturn = 1, isBarrier = 1, Uses = [C2],
+     isCodeGenOnly = 0, Size = 8 in
+@@ -1824,6 +1940,25 @@ def : Pat<(riscv_cap_tail texternalsym:$dst),
+           (PseudoCTAIL texternalsym:$dst)>;
+ } // Predicates = [HasCheri, IsCapMode, IsPureCapABI]
+ 
++let Predicates = [HasCheri, IsCapMode, IsPureCapABI] in
++let isCall = 1, isCodeGenOnly = 0, Size = 8, hasSideEffects = 0, 
++    mayStore = 0, mayLoad = 0 in
++def PseudoCCALLCustomRA : Pseudo<(outs GPCR:$rd),
++                         (ins pseudo_cap_jump_symbol:$target), []> {
++  let AsmString = "cjump\t$target, $rd";
++}
++
++let Predicates = [HasCheri, IsCapMode, IsPureCapABI] in
++let isCall = 1, isCodeGenOnly = 1, Size = 12, hasSideEffects = 0, 
++    mayStore = 0, mayLoad = 1, Defs = [C2] in
++def PseudoCCALLIndirectSentry : Pseudo<(outs GPCR:$rd),(ins pseudo_cap_jump_symbol:$target), []>;
++
++let Predicates = [HasCheri, IsCapMode, IsPureCapABI] in
++let isCall = 1, isCodeGenOnly = 1, Size = 16, hasSideEffects = 0, 
++    mayStore = 0, mayLoad = 1, Defs = [C2, C8] in
++def PseudoCCALLIndirectSentryFP : Pseudo<(outs GPCR:$rd),
++                         (ins pseudo_cap_jump_symbol:$target), []>;
++
+ let Predicates = [HasCheri, IsCapMode, IsPureCapABI] in
+ let isCall = 0, isBarrier = 1, isBranch = 1, isTerminator = 1, Size = 8,
+     isCodeGenOnly = 0, hasSideEffects = 0, mayStore = 0, mayLoad = 0 in
+diff --git a/llvm/lib/Target/RISCV/RISCVMCInstLower.cpp b/llvm/lib/Target/RISCV/RISCVMCInstLower.cpp
+index 66a560d94a62..09d4eff935c7 100644
+--- a/llvm/lib/Target/RISCV/RISCVMCInstLower.cpp
++++ b/llvm/lib/Target/RISCV/RISCVMCInstLower.cpp
+@@ -147,6 +147,8 @@ bool llvm::lowerRISCVMachineOperandToMCOperand(const MachineOperand &MO,
+   case MachineOperand::MO_JumpTableIndex:
+     MCOp = lowerSymbolOperand(MO, AP.GetJTISymbol(MO.getIndex()), AP);
+     break;
++  case MachineOperand::MO_MCSymbol:
++    MCOp = lowerSymbolOperand(MO, MO.getMCSymbol(), AP);
+   }
+   return true;
+ }
+diff --git a/llvm/lib/Target/RISCV/RISCVMachineFunctionInfo.h b/llvm/lib/Target/RISCV/RISCVMachineFunctionInfo.h
+index 622767540d99..dfb79258b752 100644
+--- a/llvm/lib/Target/RISCV/RISCVMachineFunctionInfo.h
++++ b/llvm/lib/Target/RISCV/RISCVMachineFunctionInfo.h
+@@ -17,6 +17,8 @@
+ #include "llvm/CodeGen/MIRYamlMapping.h"
+ #include "llvm/CodeGen/MachineFrameInfo.h"
+ #include "llvm/CodeGen/MachineFunction.h"
++#include "llvm/CodeGen/Register.h"
++#include "llvm/CodeGen/SelectionDAGNodes.h"
+ 
+ namespace llvm {
+ 
+@@ -64,6 +66,9 @@ private:
+   /// Size of stack frame to save callee saved registers
+   unsigned CalleeSavedStackSize = 0;
+ 
++  /// Register with capability to stack passed arg struct
++  Register StackPassedArgRegister = RISCV::C30;
++
+ public:
+   RISCVMachineFunctionInfo(const MachineFunction &MF) {}
+ 
+@@ -109,6 +114,9 @@ public:
+   void setCalleeSavedStackSize(unsigned Size) { CalleeSavedStackSize = Size; }
+ 
+   void initializeBaseYamlFields(const yaml::RISCVMachineFunctionInfo &YamlMFI);
++
++  Register getStackPassedArgRegister() const { return StackPassedArgRegister; }
++  void setStackPassedArgRegister(Register Reg) { StackPassedArgRegister = Reg; }
+ };
+ 
+ } // end namespace llvm
+diff --git a/llvm/lib/Target/RISCV/RISCVRegisterInfo.cpp b/llvm/lib/Target/RISCV/RISCVRegisterInfo.cpp
+index 50e36ac53350..7eddc9bd0232 100644
+--- a/llvm/lib/Target/RISCV/RISCVRegisterInfo.cpp
++++ b/llvm/lib/Target/RISCV/RISCVRegisterInfo.cpp
+@@ -43,6 +43,21 @@ static_assert(RISCV::F31_D == RISCV::F0_D + 31,
+ static_assert(RISCV::V1 == RISCV::V0 + 1, "Register list not consecutive");
+ static_assert(RISCV::V31 == RISCV::V0 + 31, "Register list not consecutive");
+ 
++static cl::opt<bool>
++    CHERIUninitClearRegs("cheri-uninit-clear-regs",
++    cl::desc("Clear registers upon call and return for uninit CC"),
++    cl::init(true));
++
++bool RISCVRegisterInfo::requiresRegisterClearing() const {
++  return CHERIUninitClearRegs;
++}
++
++static cl::opt<bool> CHERIUninitReduceCalleeSavedRegs(
++    "cheri-uninit-reduce-callee-saved-regs",
++    cl::desc("Use smaller set (see RISCVRegisterInfo.cpp for what set) of "
++             "callee-saved registers to save on register clearing cost."),
++    cl::init(false));
++
+ RISCVRegisterInfo::RISCVRegisterInfo(const RISCVSubtarget &STI)
+     : RISCVGenRegisterInfo(RISCVABI::isCheriPureCapABI(STI.getTargetABI())
+                                ? RISCV::C1 : RISCV::X1,
+@@ -54,6 +69,12 @@ RISCVRegisterInfo::getCalleeSavedRegs(const MachineFunction *MF) const {
+   auto &Subtarget = MF->getSubtarget<RISCVSubtarget>();
+   if (MF->getFunction().getCallingConv() == CallingConv::GHC)
+     return CSR_NoRegs_SaveList;
++  // Secure calling convention clears registers before call and return
++  if (MF->getFunction().getCallingConv() == CallingConv::CHERI_Uninit &&
++      this->requiresRegisterClearing())
++    return CSR_CHERI_Uninit_SaveList;
++  // Reduce CSR set for regular call to reduce clearing cost
++  if (CHERIUninitReduceCalleeSavedRegs) return CSR_CHERI_Reduced_SaveList;
+   if (MF->getFunction().hasFnAttribute("interrupt")) {
+     if (Subtarget.hasStdExtD())
+       return Subtarget.hasCheri() ? CSR_XLEN_CLEN_F64_Interrupt_SaveList
+@@ -100,6 +121,12 @@ BitVector RISCVRegisterInfo::getReservedRegs(const MachineFunction &MF) const {
+       markSuperRegs(Reserved, Reg);
+   }
+ 
++  // mark reserve stack register as reserved
++  if (STI.hasReserveStack()){
++    markSuperRegs(Reserved, RISCV::X31);
++    markSuperRegs(Reserved, RISCV::C31);
++  }
++
+   // Use markSuperRegs to ensure any register aliases are also reserved
+   markSuperRegs(Reserved, RISCV::X0); // zero
+   markSuperRegs(Reserved, RISCV::X2); // sp
+@@ -345,6 +372,9 @@ RISCVRegisterInfo::getCallPreservedMask(const MachineFunction & MF,
+ 
+   if (CC == CallingConv::GHC)
+     return CSR_NoRegs_RegMask;
++  if (CC == CallingConv::CHERI_Uninit && requiresRegisterClearing())
++    return CSR_CHERI_Uninit_RegMask;
++  if (CHERIUninitReduceCalleeSavedRegs) return CSR_CHERI_Reduced_RegMask;
+   switch (Subtarget.getTargetABI()) {
+   default:
+     llvm_unreachable("Unrecognized ABI");
+diff --git a/llvm/lib/Target/RISCV/RISCVRegisterInfo.h b/llvm/lib/Target/RISCV/RISCVRegisterInfo.h
+index 30ea1efae84f..8c80b9fbcdf7 100644
+--- a/llvm/lib/Target/RISCV/RISCVRegisterInfo.h
++++ b/llvm/lib/Target/RISCV/RISCVRegisterInfo.h
+@@ -69,6 +69,8 @@ struct RISCVRegisterInfo : public RISCVGenRegisterInfo {
+                         SmallVectorImpl<uint64_t> &Ops) const override;
+ 
+   unsigned getRegisterCostTableIndex(const MachineFunction &MF) const override;
++
++  bool requiresRegisterClearing(void) const;
+ };
+ }
+ 
+diff --git a/llvm/lib/Target/RISCV/RISCVRegisterInfo.td b/llvm/lib/Target/RISCV/RISCVRegisterInfo.td
+index 716fdf2aa924..2c76d0b8f824 100644
+--- a/llvm/lib/Target/RISCV/RISCVRegisterInfo.td
++++ b/llvm/lib/Target/RISCV/RISCVRegisterInfo.td
+@@ -168,7 +168,7 @@ let RegAltNameIndices = [ABIRegAltName] in {
+   def C28 : RISCVCapReg<X28,"c28", ["ct3"]>, DwarfRegNum<[28]>;
+   def C29 : RISCVCapReg<X29,"c29", ["ct4"]>, DwarfRegNum<[29]>;
+   def C30 : RISCVCapReg<X30,"c30", ["ct5"]>, DwarfRegNum<[30]>;
+-  def C31 : RISCVCapReg<X31,"c31", ["ct6"]>, DwarfRegNum<[31]>;
++  def C31 : RISCVCapReg<X31,"c31", ["ct6", "idc"]>, DwarfRegNum<[31]>;
+   }
+ 
+   // This is the encoding of DDC when C0 means DDC, and not the encoding of DDC
+diff --git a/llvm/lib/Target/RISCV/RISCVSubtarget.cpp b/llvm/lib/Target/RISCV/RISCVSubtarget.cpp
+index 96708dc501a7..d64cd5a6042e 100644
+--- a/llvm/lib/Target/RISCV/RISCVSubtarget.cpp
++++ b/llvm/lib/Target/RISCV/RISCVSubtarget.cpp
+@@ -19,6 +19,7 @@
+ #include "RISCVRegisterBankInfo.h"
+ #include "RISCVTargetMachine.h"
+ #include "llvm/MC/TargetRegistry.h"
++#include "llvm/Support/CommandLine.h"
+ #include "llvm/Support/ErrorHandling.h"
+ 
+ using namespace llvm;
+@@ -211,3 +212,50 @@ void RISCVSubtarget::getPostRAMutations(
+     std::vector<std::unique_ptr<ScheduleDAGMutation>> &Mutations) const {
+   Mutations.push_back(createRISCVMacroFusionDAGMutation());
+ }
++
++static cl::opt<RISCVSubtarget::CHERIUninitEncapOpts> CHERIUninitReturnEncap(
++    "cheri-uninit-return-encapsulation",
++    cl::desc("Select which return encapsulation mechanism"
++             "to use when calling with the uninit CC"),
++    cl::values(clEnumValN(RISCVSubtarget::none, "none", "No encapsulation"),
++               clEnumValN(RISCVSubtarget::trampoline, "trampoline", "Trampoline"),
++               clEnumValN(RISCVSubtarget::isentry, "isentry", "Indirect sentry")));
++
++RISCVSubtarget::CHERIUninitEncapOpts RISCVSubtarget::getCHERIUninitEncap() const {
++  return CHERIUninitReturnEncap;
++}
++
++static cl::opt<RISCVSubtarget::CHERIStackRevocation> CHERIStackRevocationOpt(
++    "cheri-stack-revocation", cl::desc("Type of stack revocation to expect."),
++    cl::init(RISCVSubtarget::CHERIStackNoRevocation),
++    cl::values(
++        clEnumValN(RISCVSubtarget::CHERIStackNoRevocation, "none",
++                   "No stack revocation."),
++        clEnumValN(RISCVSubtarget::CHERIStackUninit, "uninit",
++                   "Uninitialized stack capability"),
++        clEnumValN(RISCVSubtarget::CHERIStackUninitReserve, "uninitreserve",
++                   "Uninitialized stack capability with reserve stack")));
++
++RISCVSubtarget::CHERIStackRevocation RISCVSubtarget::getCHERIStackRevocation() const {
++  return CHERIStackRevocationOpt;
++}
++
++bool RISCVSubtarget::hasUninitStack() const {
++  switch (getCHERIStackRevocation()) {
++  case RISCVSubtarget::CHERIStackUninit:
++  case RISCVSubtarget::CHERIStackUninitReserve:
++    return true;
++  case RISCVSubtarget::CHERIStackNoRevocation:
++    return false;
++  }
++}
++
++bool RISCVSubtarget::hasReserveStack() const {
++  switch (getCHERIStackRevocation()) {
++  case RISCVSubtarget::CHERIStackUninitReserve:
++    return true;
++  case RISCVSubtarget::CHERIStackUninit:
++  case RISCVSubtarget::CHERIStackNoRevocation:
++    return false;
++  }
++}
+diff --git a/llvm/lib/Target/RISCV/RISCVSubtarget.h b/llvm/lib/Target/RISCV/RISCVSubtarget.h
+index e06e81869ba5..84eaba93ceea 100644
+--- a/llvm/lib/Target/RISCV/RISCVSubtarget.h
++++ b/llvm/lib/Target/RISCV/RISCVSubtarget.h
+@@ -290,6 +290,24 @@ public:
+ 
+   void getPostRAMutations(std::vector<std::unique_ptr<ScheduleDAGMutation>>
+                               &Mutations) const override;
++
++  
++  enum CHERIUninitEncapOpts {
++    none, trampoline, isentry
++  };
++
++  CHERIUninitEncapOpts getCHERIUninitEncap() const;
++  
++  enum CHERIStackRevocation {
++    CHERIStackNoRevocation,
++    CHERIStackUninit,
++    CHERIStackUninitReserve
++  };
++
++  CHERIStackRevocation getCHERIStackRevocation() const;
++
++  bool hasUninitStack() const;
++  bool hasReserveStack() const;
+ };
+ } // End llvm namespace
+ 
+diff --git a/llvm/test/CodeGen/RISCV/cheri/uninit/uninit-large-frame.ll b/llvm/test/CodeGen/RISCV/cheri/uninit/uninit-large-frame.ll
+new file mode 100644
+index 000000000000..193ca473c8c0
+--- /dev/null
++++ b/llvm/test/CodeGen/RISCV/cheri/uninit/uninit-large-frame.ll
+@@ -0,0 +1,608 @@
++; NOTE: Assertions have been autogenerated by utils/update_llc_test_checks.py
++; RUN: %riscv64_cheri_uninit_llc -verify-machineinstrs -o - %s | FileCheck %s
++; Regression test for a crash found while compiling functions with frames greater than 2048 bytes
++; after the April 2021 upstream LLVM merge (caused by a mismerge of 02ffbac844e01df2c95dfcb3117213211fe2226d).
++; Assertion failed: (RealDef != nullptr && "Must have at least 1 Def"), function scavengeVReg
++
++%struct.large = type { [1024 x i8] }
++%struct.too.large = type { [2048 x i8] }
++
++declare i32 @use_i128(i128 addrspace(200)*)
++declare i32 @use_large(%struct.large addrspace(200)*)
++declare i32 @use_too_large(%struct.too.large addrspace(200)*)
++
++define void @frame_locals_below_threshold(i128 addrspace(200)*%arg1, i128 addrspace(200)*%arg2, i128 addrspace(200)*%arg3, i128 addrspace(200)*%arg4, i128 addrspace(200)*%arg5, i128 addrspace(200)*%arg6, i128 addrspace(200)*%arg7, i128 addrspace(200)*%arg8, i128 addrspace(200)*%arg9) local_unnamed_addr addrspace(200) nounwind {
++; CHECK-LABEL: frame_locals_below_threshold:
++; CHECK:       # %bb.0: # %entry
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    csc cra, 1056(csp) # 16-byte Folded Spill
++; CHECK-NEXT:    cincoffset ca0, csp, 1040
++; CHECK-NEXT:    csetbounds ca0, ca0, 16
++; CHECK-NEXT:    ccall use_i128
++; CHECK-NEXT:    cincoffset ca0, csp, 16
++; CHECK-NEXT:    csetbounds ca0, ca0, 1024
++; CHECK-NEXT:    ccall use_large
++; CHECK-NEXT:    clc cra, 1056(csp) # 16-byte Folded Reload
++; CHECK-NEXT:    csc cnull, 0(csp)
++; CHECK-NEXT:    csc cnull, 16(csp)
++; CHECK-NEXT:    csc cnull, 32(csp)
++; CHECK-NEXT:    csc cnull, 48(csp)
++; CHECK-NEXT:    csc cnull, 64(csp)
++; CHECK-NEXT:    csc cnull, 80(csp)
++; CHECK-NEXT:    csc cnull, 96(csp)
++; CHECK-NEXT:    csc cnull, 112(csp)
++; CHECK-NEXT:    csc cnull, 128(csp)
++; CHECK-NEXT:    csc cnull, 144(csp)
++; CHECK-NEXT:    csc cnull, 160(csp)
++; CHECK-NEXT:    csc cnull, 176(csp)
++; CHECK-NEXT:    csc cnull, 192(csp)
++; CHECK-NEXT:    csc cnull, 208(csp)
++; CHECK-NEXT:    csc cnull, 224(csp)
++; CHECK-NEXT:    csc cnull, 240(csp)
++; CHECK-NEXT:    csc cnull, 256(csp)
++; CHECK-NEXT:    csc cnull, 272(csp)
++; CHECK-NEXT:    csc cnull, 288(csp)
++; CHECK-NEXT:    csc cnull, 304(csp)
++; CHECK-NEXT:    csc cnull, 320(csp)
++; CHECK-NEXT:    csc cnull, 336(csp)
++; CHECK-NEXT:    csc cnull, 352(csp)
++; CHECK-NEXT:    csc cnull, 368(csp)
++; CHECK-NEXT:    csc cnull, 384(csp)
++; CHECK-NEXT:    csc cnull, 400(csp)
++; CHECK-NEXT:    csc cnull, 416(csp)
++; CHECK-NEXT:    csc cnull, 432(csp)
++; CHECK-NEXT:    csc cnull, 448(csp)
++; CHECK-NEXT:    csc cnull, 464(csp)
++; CHECK-NEXT:    csc cnull, 480(csp)
++; CHECK-NEXT:    csc cnull, 496(csp)
++; CHECK-NEXT:    csc cnull, 512(csp)
++; CHECK-NEXT:    csc cnull, 528(csp)
++; CHECK-NEXT:    csc cnull, 544(csp)
++; CHECK-NEXT:    csc cnull, 560(csp)
++; CHECK-NEXT:    csc cnull, 576(csp)
++; CHECK-NEXT:    csc cnull, 592(csp)
++; CHECK-NEXT:    csc cnull, 608(csp)
++; CHECK-NEXT:    csc cnull, 624(csp)
++; CHECK-NEXT:    csc cnull, 640(csp)
++; CHECK-NEXT:    csc cnull, 656(csp)
++; CHECK-NEXT:    csc cnull, 672(csp)
++; CHECK-NEXT:    csc cnull, 688(csp)
++; CHECK-NEXT:    csc cnull, 704(csp)
++; CHECK-NEXT:    csc cnull, 720(csp)
++; CHECK-NEXT:    csc cnull, 736(csp)
++; CHECK-NEXT:    csc cnull, 752(csp)
++; CHECK-NEXT:    csc cnull, 768(csp)
++; CHECK-NEXT:    csc cnull, 784(csp)
++; CHECK-NEXT:    csc cnull, 800(csp)
++; CHECK-NEXT:    csc cnull, 816(csp)
++; CHECK-NEXT:    csc cnull, 832(csp)
++; CHECK-NEXT:    csc cnull, 848(csp)
++; CHECK-NEXT:    csc cnull, 864(csp)
++; CHECK-NEXT:    csc cnull, 880(csp)
++; CHECK-NEXT:    csc cnull, 896(csp)
++; CHECK-NEXT:    csc cnull, 912(csp)
++; CHECK-NEXT:    csc cnull, 928(csp)
++; CHECK-NEXT:    csc cnull, 944(csp)
++; CHECK-NEXT:    csc cnull, 960(csp)
++; CHECK-NEXT:    csc cnull, 976(csp)
++; CHECK-NEXT:    csc cnull, 992(csp)
++; CHECK-NEXT:    csc cnull, 1008(csp)
++; CHECK-NEXT:    csc cnull, 1024(csp)
++; CHECK-NEXT:    csc cnull, 1040(csp)
++; CHECK-NEXT:    csc cnull, 1056(csp)
++; CHECK-NEXT:    cincoffset csp, csp, 1072
++; CHECK-NEXT:    cret
++entry:
++  %obj1 = alloca i128, align 16, addrspace(200)
++  %obj2 = alloca %struct.large, align 1, addrspace(200)
++  call i32 @use_i128(i128 addrspace(200)* %obj1)
++  call i32 @use_large(%struct.large addrspace(200)* %obj2)
++  ret void
++}
++
++define void @locals_below_frame_above_threshold(i128 addrspace(200)*%arg1, i128 addrspace(200)*%arg2, i128 addrspace(200)*%arg3, i128 addrspace(200)*%arg4, i128 addrspace(200)*%arg5, i128 addrspace(200)*%arg6, i128 addrspace(200)*%arg7, i128 addrspace(200)*%arg8, i128 addrspace(200)*%arg9, i128 addrspace(200)*%arg10, i128 addrspace(200)*%arg11) local_unnamed_addr addrspace(200) nounwind {
++; CHECK-LABEL: locals_below_frame_above_threshold:
++; CHECK:       # %bb.0: # %entry
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    csc cra, 1056(csp) # 16-byte Folded Spill
++; CHECK-NEXT:    cincoffset ca0, csp, 1040
++; CHECK-NEXT:    csetbounds ca0, ca0, 16
++; CHECK-NEXT:    ccall use_i128
++; CHECK-NEXT:    cincoffset ca0, csp, 16
++; CHECK-NEXT:    csetbounds ca0, ca0, 1024
++; CHECK-NEXT:    ccall use_large
++; CHECK-NEXT:    clc cra, 1056(csp) # 16-byte Folded Reload
++; CHECK-NEXT:    csc cnull, 0(csp)
++; CHECK-NEXT:    csc cnull, 16(csp)
++; CHECK-NEXT:    csc cnull, 32(csp)
++; CHECK-NEXT:    csc cnull, 48(csp)
++; CHECK-NEXT:    csc cnull, 64(csp)
++; CHECK-NEXT:    csc cnull, 80(csp)
++; CHECK-NEXT:    csc cnull, 96(csp)
++; CHECK-NEXT:    csc cnull, 112(csp)
++; CHECK-NEXT:    csc cnull, 128(csp)
++; CHECK-NEXT:    csc cnull, 144(csp)
++; CHECK-NEXT:    csc cnull, 160(csp)
++; CHECK-NEXT:    csc cnull, 176(csp)
++; CHECK-NEXT:    csc cnull, 192(csp)
++; CHECK-NEXT:    csc cnull, 208(csp)
++; CHECK-NEXT:    csc cnull, 224(csp)
++; CHECK-NEXT:    csc cnull, 240(csp)
++; CHECK-NEXT:    csc cnull, 256(csp)
++; CHECK-NEXT:    csc cnull, 272(csp)
++; CHECK-NEXT:    csc cnull, 288(csp)
++; CHECK-NEXT:    csc cnull, 304(csp)
++; CHECK-NEXT:    csc cnull, 320(csp)
++; CHECK-NEXT:    csc cnull, 336(csp)
++; CHECK-NEXT:    csc cnull, 352(csp)
++; CHECK-NEXT:    csc cnull, 368(csp)
++; CHECK-NEXT:    csc cnull, 384(csp)
++; CHECK-NEXT:    csc cnull, 400(csp)
++; CHECK-NEXT:    csc cnull, 416(csp)
++; CHECK-NEXT:    csc cnull, 432(csp)
++; CHECK-NEXT:    csc cnull, 448(csp)
++; CHECK-NEXT:    csc cnull, 464(csp)
++; CHECK-NEXT:    csc cnull, 480(csp)
++; CHECK-NEXT:    csc cnull, 496(csp)
++; CHECK-NEXT:    csc cnull, 512(csp)
++; CHECK-NEXT:    csc cnull, 528(csp)
++; CHECK-NEXT:    csc cnull, 544(csp)
++; CHECK-NEXT:    csc cnull, 560(csp)
++; CHECK-NEXT:    csc cnull, 576(csp)
++; CHECK-NEXT:    csc cnull, 592(csp)
++; CHECK-NEXT:    csc cnull, 608(csp)
++; CHECK-NEXT:    csc cnull, 624(csp)
++; CHECK-NEXT:    csc cnull, 640(csp)
++; CHECK-NEXT:    csc cnull, 656(csp)
++; CHECK-NEXT:    csc cnull, 672(csp)
++; CHECK-NEXT:    csc cnull, 688(csp)
++; CHECK-NEXT:    csc cnull, 704(csp)
++; CHECK-NEXT:    csc cnull, 720(csp)
++; CHECK-NEXT:    csc cnull, 736(csp)
++; CHECK-NEXT:    csc cnull, 752(csp)
++; CHECK-NEXT:    csc cnull, 768(csp)
++; CHECK-NEXT:    csc cnull, 784(csp)
++; CHECK-NEXT:    csc cnull, 800(csp)
++; CHECK-NEXT:    csc cnull, 816(csp)
++; CHECK-NEXT:    csc cnull, 832(csp)
++; CHECK-NEXT:    csc cnull, 848(csp)
++; CHECK-NEXT:    csc cnull, 864(csp)
++; CHECK-NEXT:    csc cnull, 880(csp)
++; CHECK-NEXT:    csc cnull, 896(csp)
++; CHECK-NEXT:    csc cnull, 912(csp)
++; CHECK-NEXT:    csc cnull, 928(csp)
++; CHECK-NEXT:    csc cnull, 944(csp)
++; CHECK-NEXT:    csc cnull, 960(csp)
++; CHECK-NEXT:    csc cnull, 976(csp)
++; CHECK-NEXT:    csc cnull, 992(csp)
++; CHECK-NEXT:    csc cnull, 1008(csp)
++; CHECK-NEXT:    csc cnull, 1024(csp)
++; CHECK-NEXT:    csc cnull, 1040(csp)
++; CHECK-NEXT:    csc cnull, 1056(csp)
++; CHECK-NEXT:    cincoffset csp, csp, 1072
++; CHECK-NEXT:    cret
++entry:
++  %obj1 = alloca i128, align 16, addrspace(200)
++  %obj2 = alloca %struct.large, align 1, addrspace(200)
++  call i32 @use_i128(i128 addrspace(200)* %obj1)
++  call i32 @use_large(%struct.large addrspace(200)* %obj2)
++  ret void
++}
++
++define void @frame_locals_above_threshold(i128 addrspace(200)*%arg1, i128 addrspace(200)*%arg2, i128 addrspace(200)*%arg3, i128 addrspace(200)*%arg4, i128 addrspace(200)*%arg5, i128 addrspace(200)*%arg6, i128 addrspace(200)*%arg7, i128 addrspace(200)*%arg8, i128 addrspace(200)*%arg9, i128 addrspace(200)*%arg10, i128 addrspace(200)*%arg11) local_unnamed_addr addrspace(200) nounwind {
++; CHECK-LABEL: frame_locals_above_threshold:
++; CHECK:       # %bb.0: # %entry
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    csc cra, 2016(csp) # 16-byte Folded Spill
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    usc csp, cnull, csp
++; CHECK-NEXT:    lui a0, 1
++; CHECK-NEXT:    addiw a0, a0, -2032
++; CHECK-NEXT:    cincoffset ca0, csp, a0
++; CHECK-NEXT:    csetbounds ca0, ca0, 16
++; CHECK-NEXT:    ccall use_i128
++; CHECK-NEXT:    cincoffset ca0, csp, 16
++; CHECK-NEXT:    csetbounds ca0, ca0, 2048
++; CHECK-NEXT:    ccall use_too_large
++; CHECK-NEXT:    csc cnull, 0(csp)
++; CHECK-NEXT:    csc cnull, 16(csp)
++; CHECK-NEXT:    csc cnull, 32(csp)
++; CHECK-NEXT:    csc cnull, 48(csp)
++; CHECK-NEXT:    cincoffset csp, csp, 64
++; CHECK-NEXT:    clc cra, 2016(csp) # 16-byte Folded Reload
++; CHECK-NEXT:    csc cnull, 0(csp)
++; CHECK-NEXT:    csc cnull, 16(csp)
++; CHECK-NEXT:    csc cnull, 32(csp)
++; CHECK-NEXT:    csc cnull, 48(csp)
++; CHECK-NEXT:    csc cnull, 64(csp)
++; CHECK-NEXT:    csc cnull, 80(csp)
++; CHECK-NEXT:    csc cnull, 96(csp)
++; CHECK-NEXT:    csc cnull, 112(csp)
++; CHECK-NEXT:    csc cnull, 128(csp)
++; CHECK-NEXT:    csc cnull, 144(csp)
++; CHECK-NEXT:    csc cnull, 160(csp)
++; CHECK-NEXT:    csc cnull, 176(csp)
++; CHECK-NEXT:    csc cnull, 192(csp)
++; CHECK-NEXT:    csc cnull, 208(csp)
++; CHECK-NEXT:    csc cnull, 224(csp)
++; CHECK-NEXT:    csc cnull, 240(csp)
++; CHECK-NEXT:    csc cnull, 256(csp)
++; CHECK-NEXT:    csc cnull, 272(csp)
++; CHECK-NEXT:    csc cnull, 288(csp)
++; CHECK-NEXT:    csc cnull, 304(csp)
++; CHECK-NEXT:    csc cnull, 320(csp)
++; CHECK-NEXT:    csc cnull, 336(csp)
++; CHECK-NEXT:    csc cnull, 352(csp)
++; CHECK-NEXT:    csc cnull, 368(csp)
++; CHECK-NEXT:    csc cnull, 384(csp)
++; CHECK-NEXT:    csc cnull, 400(csp)
++; CHECK-NEXT:    csc cnull, 416(csp)
++; CHECK-NEXT:    csc cnull, 432(csp)
++; CHECK-NEXT:    csc cnull, 448(csp)
++; CHECK-NEXT:    csc cnull, 464(csp)
++; CHECK-NEXT:    csc cnull, 480(csp)
++; CHECK-NEXT:    csc cnull, 496(csp)
++; CHECK-NEXT:    csc cnull, 512(csp)
++; CHECK-NEXT:    csc cnull, 528(csp)
++; CHECK-NEXT:    csc cnull, 544(csp)
++; CHECK-NEXT:    csc cnull, 560(csp)
++; CHECK-NEXT:    csc cnull, 576(csp)
++; CHECK-NEXT:    csc cnull, 592(csp)
++; CHECK-NEXT:    csc cnull, 608(csp)
++; CHECK-NEXT:    csc cnull, 624(csp)
++; CHECK-NEXT:    csc cnull, 640(csp)
++; CHECK-NEXT:    csc cnull, 656(csp)
++; CHECK-NEXT:    csc cnull, 672(csp)
++; CHECK-NEXT:    csc cnull, 688(csp)
++; CHECK-NEXT:    csc cnull, 704(csp)
++; CHECK-NEXT:    csc cnull, 720(csp)
++; CHECK-NEXT:    csc cnull, 736(csp)
++; CHECK-NEXT:    csc cnull, 752(csp)
++; CHECK-NEXT:    csc cnull, 768(csp)
++; CHECK-NEXT:    csc cnull, 784(csp)
++; CHECK-NEXT:    csc cnull, 800(csp)
++; CHECK-NEXT:    csc cnull, 816(csp)
++; CHECK-NEXT:    csc cnull, 832(csp)
++; CHECK-NEXT:    csc cnull, 848(csp)
++; CHECK-NEXT:    csc cnull, 864(csp)
++; CHECK-NEXT:    csc cnull, 880(csp)
++; CHECK-NEXT:    csc cnull, 896(csp)
++; CHECK-NEXT:    csc cnull, 912(csp)
++; CHECK-NEXT:    csc cnull, 928(csp)
++; CHECK-NEXT:    csc cnull, 944(csp)
++; CHECK-NEXT:    csc cnull, 960(csp)
++; CHECK-NEXT:    csc cnull, 976(csp)
++; CHECK-NEXT:    csc cnull, 992(csp)
++; CHECK-NEXT:    csc cnull, 1008(csp)
++; CHECK-NEXT:    csc cnull, 1024(csp)
++; CHECK-NEXT:    csc cnull, 1040(csp)
++; CHECK-NEXT:    csc cnull, 1056(csp)
++; CHECK-NEXT:    csc cnull, 1072(csp)
++; CHECK-NEXT:    csc cnull, 1088(csp)
++; CHECK-NEXT:    csc cnull, 1104(csp)
++; CHECK-NEXT:    csc cnull, 1120(csp)
++; CHECK-NEXT:    csc cnull, 1136(csp)
++; CHECK-NEXT:    csc cnull, 1152(csp)
++; CHECK-NEXT:    csc cnull, 1168(csp)
++; CHECK-NEXT:    csc cnull, 1184(csp)
++; CHECK-NEXT:    csc cnull, 1200(csp)
++; CHECK-NEXT:    csc cnull, 1216(csp)
++; CHECK-NEXT:    csc cnull, 1232(csp)
++; CHECK-NEXT:    csc cnull, 1248(csp)
++; CHECK-NEXT:    csc cnull, 1264(csp)
++; CHECK-NEXT:    csc cnull, 1280(csp)
++; CHECK-NEXT:    csc cnull, 1296(csp)
++; CHECK-NEXT:    csc cnull, 1312(csp)
++; CHECK-NEXT:    csc cnull, 1328(csp)
++; CHECK-NEXT:    csc cnull, 1344(csp)
++; CHECK-NEXT:    csc cnull, 1360(csp)
++; CHECK-NEXT:    csc cnull, 1376(csp)
++; CHECK-NEXT:    csc cnull, 1392(csp)
++; CHECK-NEXT:    csc cnull, 1408(csp)
++; CHECK-NEXT:    csc cnull, 1424(csp)
++; CHECK-NEXT:    csc cnull, 1440(csp)
++; CHECK-NEXT:    csc cnull, 1456(csp)
++; CHECK-NEXT:    csc cnull, 1472(csp)
++; CHECK-NEXT:    csc cnull, 1488(csp)
++; CHECK-NEXT:    csc cnull, 1504(csp)
++; CHECK-NEXT:    csc cnull, 1520(csp)
++; CHECK-NEXT:    csc cnull, 1536(csp)
++; CHECK-NEXT:    csc cnull, 1552(csp)
++; CHECK-NEXT:    csc cnull, 1568(csp)
++; CHECK-NEXT:    csc cnull, 1584(csp)
++; CHECK-NEXT:    csc cnull, 1600(csp)
++; CHECK-NEXT:    csc cnull, 1616(csp)
++; CHECK-NEXT:    csc cnull, 1632(csp)
++; CHECK-NEXT:    csc cnull, 1648(csp)
++; CHECK-NEXT:    csc cnull, 1664(csp)
++; CHECK-NEXT:    csc cnull, 1680(csp)
++; CHECK-NEXT:    csc cnull, 1696(csp)
++; CHECK-NEXT:    csc cnull, 1712(csp)
++; CHECK-NEXT:    csc cnull, 1728(csp)
++; CHECK-NEXT:    csc cnull, 1744(csp)
++; CHECK-NEXT:    csc cnull, 1760(csp)
++; CHECK-NEXT:    csc cnull, 1776(csp)
++; CHECK-NEXT:    csc cnull, 1792(csp)
++; CHECK-NEXT:    csc cnull, 1808(csp)
++; CHECK-NEXT:    csc cnull, 1824(csp)
++; CHECK-NEXT:    csc cnull, 1840(csp)
++; CHECK-NEXT:    csc cnull, 1856(csp)
++; CHECK-NEXT:    csc cnull, 1872(csp)
++; CHECK-NEXT:    csc cnull, 1888(csp)
++; CHECK-NEXT:    csc cnull, 1904(csp)
++; CHECK-NEXT:    csc cnull, 1920(csp)
++; CHECK-NEXT:    csc cnull, 1936(csp)
++; CHECK-NEXT:    csc cnull, 1952(csp)
++; CHECK-NEXT:    csc cnull, 1968(csp)
++; CHECK-NEXT:    csc cnull, 1984(csp)
++; CHECK-NEXT:    csc cnull, 2000(csp)
++; CHECK-NEXT:    csc cnull, 2016(csp)
++; CHECK-NEXT:    cincoffset csp, csp, 2032
++; CHECK-NEXT:    cret
++entry:
++  %obj1 = alloca i128, align 16, addrspace(200)
++  %obj2 = alloca %struct.too.large, align 1, addrspace(200)
++  call i32 @use_i128(i128 addrspace(200)* %obj1)
++  call i32 @use_too_large(%struct.too.large addrspace(200)* %obj2)
++  ret void
++}
+diff --git a/llvm/test/lit.cfg.py b/llvm/test/lit.cfg.py
+index 7a8abb262263..99e9464c5acf 100644
+--- a/llvm/test/lit.cfg.py
++++ b/llvm/test/lit.cfg.py
+@@ -205,7 +205,7 @@ def ptxas_version(ptxas):
+     ptxas_cmd = subprocess.Popen([ptxas, '--version'], stdout=subprocess.PIPE)
+     ptxas_out = ptxas_cmd.stdout.read().decode('ascii')
+     ptxas_cmd.wait()
+-    match = re.search('release (\d+)\.(\d+)', ptxas_out)
++    match = re.search(r'release (\d+)\.(\d+)', ptxas_out)
+     if match:
+         return (int(match.group(1)), int(match.group(2)))
+     print('couldn\'t determine ptxas version')
+diff --git a/llvm/utils/UpdateTestChecks/asm.py b/llvm/utils/UpdateTestChecks/asm.py
+index 99644b5a399c..dbf9ca252eae 100644
+--- a/llvm/utils/UpdateTestChecks/asm.py
++++ b/llvm/utils/UpdateTestChecks/asm.py
+@@ -439,9 +439,9 @@ def scrub_asm_mips(asm, args):
+   asm = stackframe_inc_return_regex.sub('cjr $c17\n  cincoffset $c11, $c11, [[#STACKFRAME_SIZE]]', asm)
+   # Finally try to replace all other stack cincoffsets
+   if last_frame_size:
+-    asm = re.sub("cincoffset\s+\$c11,\s+\$c11, " + str(last_frame_size), "cincoffset $c11, $c11, [[#STACKFRAME_SIZE]]", asm)
+-    asm = re.sub("daddiu \$1, \$zero, " + str(last_frame_size), "daddiu $1, $zero, [[#STACKFRAME_SIZE]]", asm)
+-    asm = re.sub("daddiu\s+\$sp,\s+\$sp, " + str(last_frame_size), "daddiu $sp, $sp, [[#STACKFRAME_SIZE]]", asm)
++    asm = re.sub(r"cincoffset\s+\$c11,\s+\$c11, " + str(last_frame_size), "cincoffset $c11, $c11, [[#STACKFRAME_SIZE]]", asm)
++    asm = re.sub(r"daddiu \$1, \$zero, " + str(last_frame_size), "daddiu $1, $zero, [[#STACKFRAME_SIZE]]", asm)
++    asm = re.sub(r"daddiu\s+\$sp,\s+\$sp, " + str(last_frame_size), "daddiu $sp, $sp, [[#STACKFRAME_SIZE]]", asm)
+   return asm
+ 
+ def scrub_asm_msp430(asm, args):
+diff --git a/llvm/utils/UpdateTestChecks/common.py b/llvm/utils/UpdateTestChecks/common.py
+index 8e02488da985..43b6f9b255f8 100644
+--- a/llvm/utils/UpdateTestChecks/common.py
++++ b/llvm/utils/UpdateTestChecks/common.py
+@@ -322,7 +322,7 @@ PREFIX_RE = re.compile('^[a-zA-Z0-9_-]+$')
+ CHECK_RE = re.compile(r'^\s*(?://|[;#])\s*([^:]+?)(?:-NEXT|-NOT|-DAG|-LABEL|-SAME|-EMPTY)?:')
+ 
+ UTC_ARGS_KEY = 'UTC_ARGS:'
+-UTC_ARGS_CMD = re.compile(r'.*' + UTC_ARGS_KEY + '\s*(?P<cmd>.*)\s*$')
++UTC_ARGS_CMD = re.compile(r'.*' + UTC_ARGS_KEY + r'\s*(?P<cmd>.*)\s*$')
+ UTC_ADVERT = 'NOTE: Assertions have been autogenerated by '
+ UNUSED_NOTE = 'NOTE: These prefixes are unused and the list is autogenerated. Do not add tests below this line:'
+ 
+diff --git a/llvm/utils/update_llc_test_checks.py b/llvm/utils/update_llc_test_checks.py
+index 3cf19a9fe114..09133f8d3aac 100755
+--- a/llvm/utils/update_llc_test_checks.py
++++ b/llvm/utils/update_llc_test_checks.py
+@@ -89,6 +89,7 @@ def main():
+         llc_cmd = llc_cmd.replace("%cheri128_llc", "llc -mtriple=mips64-unknown-freebsd -mcpu=cheri128 -mattr=+cheri128")
+         llc_cmd = llc_cmd.replace("%riscv32_cheri_purecap_llc", "llc -mtriple=riscv32-unknown-freebsd -target-abi il32pc64d -mattr=+xcheri,+cap-mode")
+         llc_cmd = llc_cmd.replace("%riscv64_cheri_purecap_llc", "llc -mtriple=riscv64-unknown-freebsd -target-abi l64pc128d -mattr=+xcheri,+cap-mode")
++        llc_cmd = llc_cmd.replace("%riscv64_cheri_uninit_llc", "llc -mtriple=riscv64-unknown-freebsd -target-abi l64pcu128 -mattr=+xcheri,+cap-mode")
+         llc_cmd = llc_cmd.replace("%riscv32_cheri_llc", "llc -mtriple=riscv32-unknown-freebsd -mattr=+xcheri")
+         llc_cmd = llc_cmd.replace("%riscv64_cheri_llc", "llc -mtriple=riscv64-unknown-freebsd -mattr=+xcheri")
+       filecheck_cmd = commands[-1]
+diff --git a/llvm/utils/update_mir_test_checks.py b/llvm/utils/update_mir_test_checks.py
+index c0d028eba5ba..4b9513931a51 100755
+--- a/llvm/utils/update_mir_test_checks.py
++++ b/llvm/utils/update_mir_test_checks.py
+@@ -116,6 +116,7 @@ def build_run_list(test, run_lines, verbose=False):
+             llc_cmd = llc_cmd.replace("%cheri128_llc", "llc -mtriple=mips64-unknown-freebsd -mcpu=cheri128 -mattr=+cheri128")
+             llc_cmd = llc_cmd.replace("%riscv32_cheri_purecap_llc", "llc -mtriple=riscv32-unknown-freebsd -target-abi il32pc64 -mattr=+xcheri,+cap-mode")
+             llc_cmd = llc_cmd.replace("%riscv64_cheri_purecap_llc", "llc -mtriple=riscv64-unknown-freebsd -target-abi l64pc128 -mattr=+xcheri,+cap-mode")
++            llc_cmd = llc_cmd.replace("%riscv64_cheri_uninit_llc", "llc -mtriple=riscv64-unknown-freebsd -target-abi l64pcu128 -mattr=+xcheri,+cap-mode")
+             llc_cmd = llc_cmd.replace("%riscv32_cheri_llc", "llc -mtriple=riscv32-unknown-freebsd -mattr=+xcheri")
+             llc_cmd = llc_cmd.replace("%riscv64_cheri_llc", "llc -mtriple=riscv64-unknown-freebsd -mattr=+xcheri")
+ 

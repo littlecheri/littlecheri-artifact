@@ -1,0 +1,12 @@
+sources:
+  llvm-project: 
+    base: "/littlecheri/llvm-project"
+  coremark: "/littlecheri/coremark"
+  newlib: "/littlecheri/newlib"
+  libgloss: "/littlecheri/newlib-cygwin/libgloss"
+  libc-bench: 
+    dir: "/littlecheri/libc-bench"
+  random-callstack-ubench: "/littlecheri/random-callstack-ubench"
+
+sail_sim: "/littlecheri/sail-cheri-riscv/c_emulator/cheri_riscv_sim_RV64"
+sail_parser: "sail-parser"

@@ -1,0 +1,1096 @@
+diff --git a/Makefile b/Makefile
+index 25522412..4390eaa5 100644
+--- a/Makefile
++++ b/Makefile
+@@ -156,7 +156,7 @@ GMP_LIBS = $(shell pkg-config --libs gmp || echo -lgmp)
+ ZLIB_FLAGS = $(shell pkg-config --cflags zlib)
+ ZLIB_LIBS = $(shell pkg-config --libs zlib)
+ 
+-C_FLAGS = -I $(SAIL_LIB_DIR) -I c_emulator $(GMP_FLAGS) $(ZLIB_FLAGS) $(SOFTFLOAT_FLAGS)
++C_FLAGS = -std=gnu17 -I $(SAIL_LIB_DIR) -I c_emulator $(GMP_FLAGS) $(ZLIB_FLAGS) $(SOFTFLOAT_FLAGS)
+ C_LIBS  = $(GMP_LIBS) $(ZLIB_LIBS) $(SOFTFLOAT_LIBS)
+ 
+ # The C simulator can be built to be linked against Spike for tandem-verification.
+diff --git a/c_emulator/riscv_config.h b/c_emulator/riscv_config.h
+index f8f3eb30..cdf746c1 100644
+--- a/c_emulator/riscv_config.h
++++ b/c_emulator/riscv_config.h
+@@ -5,3 +5,4 @@ extern bool config_print_instr;
+ extern bool config_print_reg;
+ extern bool config_print_mem_access;
+ extern bool config_print_platform;
++extern bool config_print_semihosting;
+diff --git a/c_emulator/riscv_platform.c b/c_emulator/riscv_platform.c
+index 253da353..50aef072 100644
+--- a/c_emulator/riscv_platform.c
++++ b/c_emulator/riscv_platform.c
+@@ -3,6 +3,10 @@
+ #include "riscv_prelude.h"
+ #include "riscv_platform_impl.h"
+ #include "riscv_sail.h"
++#include "riscv_semihosting.h"
++#include <assert.h>
++#include <stdint.h>
++#include <stdlib.h>
+ 
+ #ifdef DEBUG_RESERVATION
+ #include <stdio.h>
+@@ -72,6 +76,11 @@ bool plat_enable_misaligned_access(unit u)
+   return rv_enable_misaligned;
+ }
+ 
++bool plat_enable_semihosting(unit u)
++{
++  return rv_enable_semihosting;
++}
++
+ bool plat_mtval_has_illegal_inst_bits(unit u)
+ {
+   return rv_mtval_has_illegal_inst_bits;
+@@ -166,3 +175,152 @@ unit memea(mach_bits len, sail_int n)
+ {
+   return UNIT;
+ }
++
++#define SEMIHOST_MAX_PARAM_COUNT 4
++void read_params(uint64_t* host_param_array, mach_bits guest_param_ptr,
++                 int param_count)
++{
++  int xlen_bytes = zxlen_val / 8;
++  for (int param_i = 0; param_i < param_count; param_i++)
++  {
++    sbits guest_param = fast_read_ram(xlen_bytes, guest_param_ptr + param_i*xlen_bytes);
++    host_param_array[param_i] = guest_param.bits;
++  }
++}
++
++void read_null_terminated_string(char* host_string, uint64_t guest_string_ptr,
++                                 uint64_t string_length)
++{
++  assert(host_string != NULL && "Got NULL instead of host_string pointer!");
++  assert(string_length > 0 && "Trying to read empty string!");
++  for (int char_i = 0; char_i < string_length; char_i++)
++  {
++    host_string[char_i] = (char)read_mem(guest_string_ptr + char_i);
++    if (!host_string[char_i]) return;
++  }
++  // null terminate the string ourselves if the buffer ran out of space
++  host_string[string_length - 1] = 0;
++}
++
++void read_n_bytes(char* host_buffer, uint64_t guest_buffer_ptr, uint64_t n)
++{
++  assert(host_buffer != NULL && "Got NULL instead of host_buffer pointer!");
++  assert(n > 0 && "Trying to read 0 bytes!");
++  for (int byte_i = 0; byte_i < n; byte_i++)
++  {
++    host_buffer[byte_i] = (char)read_mem(guest_buffer_ptr + byte_i);
++  }
++}
++
++void write_n_bytes(char* host_buffer, uint64_t guest_buffer_ptr, uint64_t n)
++{
++  assert(host_buffer != NULL && "Got NULL instead of host_buffer pointer!");
++  assert(n > 0 && "Trying to write 0 bytes!");
++  for (int byte_i = 0; byte_i < n; byte_i++)
++  {
++    write_mem(guest_buffer_ptr + byte_i, host_buffer[byte_i]);
++  }
++}
++
++void write_unsigned_int(uint64_t value, uint64_t guest_buffer_ptr, uint64_t offset)
++{
++  char* value_as_bytes = (void*)&value;
++  for (int byte_i = 0; byte_i < sizeof(value); byte_i++)
++  {
++    write_mem(guest_buffer_ptr + offset + byte_i, value_as_bytes[byte_i]);
++  }
++}
++
++mach_bits plat_handle_semihosting(uint64_t op_number, uint64_t parameter_ptr)
++{
++  riscv_semihosting_op op = op_number;
++  print_semihost_syscall("Op: %s (0x%02X)", syscall_to_string(op), op);
++  uint64_t params[SEMIHOST_MAX_PARAM_COUNT];
++  uint64_t return_value = 0;
++  SemihostGuestFD guest_fd;
++  uint64_t guest_buffer_ptr;
++  switch (op) {
++    case RISCV_SYS_OPEN:
++      read_params(params, parameter_ptr, 3);
++      int file_name_len = params[2] + 1; // parameter does not take null byte into account
++      char* file_name = (char*) malloc(file_name_len * sizeof(char));
++      read_null_terminated_string(file_name, params[0], file_name_len);
++      return_value = plat_semihost_open_impl(file_name, params[1], file_name_len);
++      free(file_name);
++      break;
++    case RISCV_SYS_EXIT:
++      assert(zxlen_val == 64 && "Not supported yet on 32 bit");
++      read_params(params, parameter_ptr, 2);
++      int exception_code = params[0];
++      int exception_subcode = params[1];
++      plat_semihost_exit_impl(exception_code, exception_subcode);
++      break;
++    case RISCV_SYS_FLEN:
++      read_params(params, parameter_ptr, 1);
++      guest_fd = params[0];
++      return_value = plat_semihost_flen_impl(guest_fd);
++      break;
++    case RISCV_SYS_ISTTY:
++      read_params(params, parameter_ptr, 1);
++      guest_fd = params[0];
++      return_value = plat_semihost_istty_impl(guest_fd);
++      break;
++    case RISCV_SYS_WRITE:
++      read_params(params, parameter_ptr, 3);
++      guest_fd = params[0];
++      guest_buffer_ptr = params[1];
++      int n_to_write = params[2];
++      char* write_buffer = (char*) malloc(n_to_write * sizeof(char));
++      read_n_bytes(write_buffer, guest_buffer_ptr, n_to_write);
++      return_value = plat_semihost_write_impl(guest_fd, write_buffer, n_to_write);
++      free(write_buffer);
++      break;
++    case RISCV_SYS_READ:
++      read_params(params, parameter_ptr, 3);
++      guest_fd = params[0];
++      guest_buffer_ptr = params[1];
++      int n_to_read = params[2];
++      char* read_buffer = (char*) malloc(n_to_read * sizeof(char));
++      return_value = plat_semihost_read_impl(guest_fd, read_buffer, n_to_read);
++      write_n_bytes(read_buffer, guest_buffer_ptr, n_to_read);
++      break;
++    case RISCV_SYS_ERRNO:
++      return_value = plat_semihost_errno_impl();
++      break;
++    case RISCV_SYS_SEEK:
++      read_params(params, parameter_ptr, 2);
++      guest_fd = params[0];
++      int offset = params[1];
++      return_value = plat_semihost_seek_impl(guest_fd, offset);
++      break;
++    case RISCV_SYS_CLOSE:
++      read_params(params, parameter_ptr, 1);
++      guest_fd = params[0];
++      return_value = plat_semihost_close_impl(guest_fd);
++      break;
++    case RISCV_SYS_TIME:
++      return_value = plat_semihost_time_impl();
++      break;
++    case RISCV_SYS_GET_CMDLINE:
++      read_params(params, parameter_ptr, 2);
++      guest_buffer_ptr = params[0];
++      int guest_buffer_len = params[1];
++      char *arg_buffer = malloc(guest_buffer_len * sizeof(guest_buffer_len));
++      return_value = plat_semihost_get_cmdline_impl(arg_buffer, guest_buffer_len);
++      if (return_value == -1) break; // negative return indicates error
++      if (return_value != 0) // write args to guest if not empty
++        write_n_bytes(arg_buffer, guest_buffer_ptr, return_value);
++      write_unsigned_int(return_value, parameter_ptr, zxlen_val/8);
++      return_value = 0;
++      break;
++    default:
++      print_semihost_syscall("Unknown operation!");
++      break;
++  }
++  if (return_value < 0) {
++    print_semihost_failure(return_value);
++  } else {
++    print_semihost_syscall("Success! Result: %d", return_value);
++  }
++  return return_value;
++}
+diff --git a/c_emulator/riscv_platform.h b/c_emulator/riscv_platform.h
+index 38fac2f0..950f497e 100644
+--- a/c_emulator/riscv_platform.h
++++ b/c_emulator/riscv_platform.h
+@@ -14,6 +14,7 @@ uint64_t sys_pmp_grain(unit);
+ 
+ bool plat_enable_dirty_update(unit);
+ bool plat_enable_misaligned_access(unit);
++bool plat_enable_semihosting(unit);
+ bool plat_mtval_has_illegal_inst_bits(unit);
+ 
+ mach_bits plat_ram_base(unit);
+@@ -40,3 +41,5 @@ unit plat_term_write(mach_bits);
+ mach_bits plat_htif_tohost(unit);
+ 
+ unit memea(mach_bits, sail_int);
++
++mach_bits plat_handle_semihosting(mach_bits, mach_bits);
+diff --git a/c_emulator/riscv_platform_impl.c b/c_emulator/riscv_platform_impl.c
+index c2ae256e..b59b7b75 100644
+--- a/c_emulator/riscv_platform_impl.c
++++ b/c_emulator/riscv_platform_impl.c
+@@ -1,6 +1,18 @@
+ #include "riscv_platform_impl.h"
++#include "riscv_config.h"
++#include "riscv_semihosting.h"
++#include <stdlib.h>
+ #include <unistd.h>
+ #include <stdio.h>
++#include <string.h>
++#include <assert.h>
++#include <fcntl.h>
++#include <sys/stat.h>
++#include <unistd.h>
++#include <errno.h>
++#include <time.h>
++#include <stdarg.h>
++#include <assert.h>
+ 
+ /* Settings of the platform implementation, with common defaults. */
+ uint64_t rv_pmp_count = 0;
+@@ -18,6 +30,9 @@ bool rv_enable_misaligned = false;
+ bool rv_mtval_has_illegal_inst_bits = false;
+ bool rv_enable_writable_fiom = true;
+ 
++bool rv_enable_semihosting = false;
++char *cmdline_args = NULL;
++
+ uint64_t rv_ram_base = UINT64_C(0x80000000);
+ uint64_t rv_ram_size = UINT64_C(0x4000000);
+ 
+@@ -42,7 +57,7 @@ uint64_t rv_16_random_bits(void)
+ uint64_t rv_clint_base = UINT64_C(0x2000000);
+ uint64_t rv_clint_size = UINT64_C(0xc0000);
+ 
+-uint64_t rv_htif_tohost = UINT64_C(0x80001000);
++uint64_t rv_htif_tohost = UINT64_C(0x0);
+ uint64_t rv_insns_per_tick = UINT64_C(100);
+ 
+ int term_fd = 1; // set during startup
+@@ -52,3 +67,350 @@ void plat_term_write_impl(char c)
+     fprintf(stderr, "Unable to write to terminal!\n");
+   }
+ }
++int term_fd_err = STDERR_FILENO;
++
++#define SEMIHOST_DEBUG_STREAM trace_log
++void print_semihost_syscall(char * specific_format, ...)
++{
++  if (!config_print_semihosting) return;
++
++  va_list args;
++  va_start(args, specific_format);
++  fprintf(SEMIHOST_DEBUG_STREAM, "[Semihost]: ");
++  vfprintf(SEMIHOST_DEBUG_STREAM, specific_format, args);
++  fprintf(SEMIHOST_DEBUG_STREAM, "\n");
++}
++
++void print_semihost_failure(int return_value)
++{
++  print_semihost_syscall("Failure!\n"
++                         "\tReturn value: %d\n"
++                         "\tError code: %s"
++                         , return_value, strerror(errno));
++}
++
++bool semihost_assert_failure_output( void )
++{
++  print_semihost_syscall("Assertion failure!");
++  return false;
++}
++
++inline void semihost_assert(int expression)
++{
++  assert(expression || semihost_assert_failure_output());
++}
++
++#define SEMIHOST_FEATURES_FD 4
++static_assert(STDOUT_FILENO != SEMIHOST_FEATURES_FD, "SEMIHOST_FEATURES_FD clashes with STDOUT_FILENO!");
++static_assert(STDIN_FILENO != SEMIHOST_FEATURES_FD, "SEMIHOST_FEATURES_FD clashes with STDIN_FILENO!");
++static_assert(STDERR_FILENO != SEMIHOST_FEATURES_FD, "SEMIHOST_FEATURES_FD clashes with STDERR_FILENO!");
++
++typedef enum SemihostFDType {
++  SemihostUnusedFD = 0,
++  SemihostHostFD,
++  SemihostStaticFD,
++  SemihostConsoleFD
++} SemihostFDType;
++
++typedef struct SemihostFDMapping {
++  // int guest_fd; guest fd is indexed by 
++  int host_fd;
++  SemihostFDType type;
++} SemihostFDMapping;
++
++// SemihostFDMapping _semihost_features_fd_map = {SEMIHOST_FEATURES_FD, NULL, NULL};
++// SemihostFDMapping _stderr_fd_map = {STDERR_FILENO, STDERR_FILENO, &_semihost_features_fd_map};
++// SemihostFDMapping _stdin_fd_map = {STDERR_FILENO, STDERR_FILENO, &_stderr_fd_map};
++// SemihostFDMapping _stdout_fd_map = {STDOUT_FILENO, STDOUT_FILENO, &_stdin_fd_map};
++
++// statically allocate array for simplicity, refine this when everything else is working
++#define MAX_FD_MAPPINGS 100
++static int fd_mapping_count = 0;
++static SemihostFDMapping fd_map[MAX_FD_MAPPINGS] = { 0 };
++
++static int guest_errno = 0;
++
++SemihostGuestFD allocate_fd_mapping(void) 
++{
++  SemihostGuestFD current_fd = 0;
++  while (current_fd < MAX_FD_MAPPINGS)
++  {
++    if (fd_map[current_fd].type == SemihostUnusedFD) break;
++    current_fd++;
++  }
++  // check we have not exhausted our mappings
++  if (current_fd == MAX_FD_MAPPINGS) return -1;
++  return current_fd;
++}
++
++void deallocate_fd_mapping(SemihostGuestFD guest_fd)
++{
++  assert(fd_map[guest_fd].type != SemihostUnusedFD && "trying to deallocate unmapped fd");
++  fd_map[guest_fd].host_fd = 0;
++  fd_map[guest_fd].type = 0;
++}
++
++SemihostGuestFD allocate_host_fd_mapping(int host_fd)
++{
++  SemihostGuestFD guest_fd = allocate_fd_mapping();
++  assert(guest_fd != -1 && "Exhausted available FD mappings");
++  fd_map[guest_fd].host_fd = host_fd;
++  fd_map[guest_fd].type = SemihostHostFD;
++  return guest_fd;
++}
++
++void plat_semihost_init()
++{
++  allocate_host_fd_mapping(STDIN_FILENO);
++  allocate_host_fd_mapping(term_fd);
++  allocate_host_fd_mapping(term_fd_err);
++}
++
++static int SEMIHOST_OPEN_MODE_MAPPING[12] = {
++  O_RDONLY                              // r
++, O_RDONLY                              // rb
++, O_RDWR                                // r+
++, O_RDWR                                // r+b
++, O_WRONLY | O_CREAT | O_TRUNC          // w
++, O_WRONLY | O_CREAT | O_TRUNC          // wb
++, O_RDWR | O_CREAT | O_TRUNC            // w+
++, O_RDWR | O_CREAT | O_TRUNC            // w+b
++, O_WRONLY | O_CREAT | O_APPEND         // a
++, O_WRONLY | O_CREAT | O_APPEND         // ab
++, O_RDWR | O_CREAT | O_APPEND           // a+
++, O_RDWR | O_CREAT | O_APPEND           // a+b
++};
++
++static char* SEMIHOST_OPEN_MODE_STRING[12] = {
++  "r"
++, "rb"
++, "r+"
++, "r+b"
++, "w"
++, "wb"
++, "w+"
++, "w+b"
++, "a"
++, "ab"
++, "a+"
++, "a+b"
++};
++
++static const char * const syscall_string[] =
++{
++  [RISCV_SYS_OPEN] = "SYS_OPEN",
++  [RISCV_SYS_CLOSE] = "SYS_CLOSE",
++  [RISCV_SYS_WRITE] = "SYS_WRITE",
++  [RISCV_SYS_READ] = "SYS_READ",
++  [RISCV_SYS_ISTTY] = "SYS_ISTTY",
++  [RISCV_SYS_SEEK] = "SYS_SEEK",
++  [RISCV_SYS_FLEN] = "SYS_FLEN",
++  [RISCV_SYS_TIME] = "SYS_TIME",
++  [RISCV_SYS_ERRNO] = "SYS_ERRNO",
++  [RISCV_SYS_GET_CMDLINE] = "SYS_GET_CMDLINE",
++  [RISCV_SYS_EXIT] = "SYS_EXIT"
++};
++
++const char *syscall_to_string(riscv_semihosting_op op) {
++  return syscall_string[op];
++}
++
++int plat_semihost_open_impl(char* file_name, int semihost_mode, int file_name_len)
++{
++  print_semihost_syscall("\tPath: %s (len: %d)", file_name, file_name_len);
++  int open_mode = SEMIHOST_OPEN_MODE_MAPPING[semihost_mode];
++  print_semihost_syscall("\tMode: %s (Semihost: %d, Unix: 0x%03X)"
++  , SEMIHOST_OPEN_MODE_STRING[semihost_mode], semihost_mode, open_mode);
++  if (strncmp(file_name, ":semihosting-features", file_name_len) == 0)
++  {
++    assert(false && "TODO: implement semihosting feature reporting");
++  }
++  if (strncmp(file_name, ":tt", file_name_len) == 0)
++  {
++    if (open_mode & O_TRUNC) {
++      print_semihost_syscall("Giving stdout handle.");
++      return STDOUT_FILENO; // w, wb, w+ or w+b is stdout
++    } else if (open_mode & O_APPEND) {
++      print_semihost_syscall("Giving stderr handle.");
++      return STDERR_FILENO; // a, ab, a+ or a+b is stderr
++    } else {
++      print_semihost_syscall("Giving stdin handle.");
++      return STDIN_FILENO;
++    }
++  }
++
++  int host_fd = open(file_name, open_mode, 0644);
++  if (host_fd < 0) { // error case
++    guest_errno = errno;
++    return -1;
++  }
++  SemihostGuestFD guest_fd = allocate_host_fd_mapping(host_fd);
++  return guest_fd;
++}
++
++extern bool zhtif_done;
++extern uint64_t zhtif_exit_code;
++
++void plat_semihost_exit_impl(int exit_code, int exit_subcode)
++{
++  zhtif_done = true;
++  switch (exit_code) {
++    case ADP_Stopped_ApplicationExit:
++      print_semihost_syscall("Normal exit.");
++      zhtif_exit_code = exit_subcode;
++      break;
++    case ADP_Stopped_AddressException:
++      print_semihost_syscall("Exception occurred!");
++      zhtif_exit_code = exit_subcode;
++      break;
++    default:
++      print_semihost_syscall("Unexpected exit code: 0x%x", exit_code);
++      zhtif_exit_code = 42;
++  }
++  
++  print_semihost_syscall("Exiting with code %d", zhtif_exit_code);
++}
++
++bool semihost_fd_assertion_fail(char* debug_message)
++{
++  print_semihost_syscall(debug_message);
++  print_semihost_syscall("FD map dump (guest, host):");
++  for (int fd_i = 0; fd_i < MAX_FD_MAPPINGS; fd_i++) {
++    if (fd_map[fd_i].type != SemihostUnusedFD)
++      print_semihost_syscall("\t(%d,%d) Type: %s (%d)",
++        fd_i, fd_map[fd_i],
++        fd_map[fd_i].type == SemihostHostFD ? "Host" : "Other", fd_map[fd_i].type
++        );
++  }
++  return false;
++}
++
++int plat_semihost_flen_impl(SemihostGuestFD guest_fd)
++{
++  print_semihost_syscall("Getting file size for handle %d", guest_fd);
++  assert(fd_map[guest_fd].type == SemihostHostFD || semihost_fd_assertion_fail("Flen not supported on non host fd"));
++  int host_fd = fd_map[guest_fd].host_fd;
++  struct stat stat_result;
++  fstat(host_fd, &stat_result);
++  print_semihost_syscall("\tStat result: %ld", stat_result.st_size);
++  return stat_result.st_size;
++}
++
++int plat_semihost_istty_impl(SemihostGuestFD guest_fd)
++{
++  assert(fd_map[guest_fd].type == SemihostHostFD && "istty only supported for host fd");
++  bool istty = isatty(fd_map[guest_fd].host_fd);
++  print_semihost_syscall("\tFile handle %d %s a TTY.", 
++    guest_fd,
++    istty ? "is" : "is not");
++  return istty;
++}
++
++int plat_semihost_write_impl(SemihostGuestFD guest_fd, char* buffer, int n)
++{
++  print_semihost_syscall( "\tWriting %d bytes to file %d.", n, guest_fd);
++  assert(fd_map[guest_fd].type == SemihostHostFD && "write only supported for host fd");
++  int return_value = write(fd_map[guest_fd].host_fd, buffer, n);
++  print_semihost_syscall("\tDone, wrote %d bytes.", return_value);
++  if (return_value == -1) {
++    guest_errno = errno;
++    return -1;
++  }
++  if (return_value < n) {
++    return n - return_value;
++  }
++  return 0;
++}
++
++int plat_semihost_read_impl(SemihostGuestFD guest_fd, char* buffer, int n)
++{
++  print_semihost_syscall("\tReading %d bytes from file %d.", n, guest_fd);
++  assert(fd_map[guest_fd].type == SemihostHostFD && "read only supported for host fd");
++  int return_value = read(fd_map[guest_fd].host_fd, buffer, n);
++  print_semihost_syscall("\tDone, read %d bytes.", return_value);
++  if (return_value == -1) {
++    guest_errno = errno;
++    return -1;
++  }
++  if (return_value < n) {
++    return n - return_value;
++  }
++  return 0;
++}
++
++int plat_semihost_errno_impl()
++{
++  return guest_errno;
++}
++
++int plat_semihost_seek_impl(SemihostGuestFD guest_fd, int offset)
++{
++  print_semihost_syscall("\tSeeking to %d in file %d.\t", offset, guest_fd);
++  assert(fd_map[guest_fd].type == SemihostHostFD && "seek only supported for host fd");
++  int return_value = lseek(fd_map[guest_fd].host_fd, offset, SEEK_SET);
++  if (return_value == -1) guest_errno = errno;
++  return return_value;
++}
++
++int plat_semihost_close_impl(SemihostGuestFD guest_fd)
++{
++  print_semihost_syscall("\tClosing file handle %d.", guest_fd);
++  assert(fd_map[guest_fd].type == SemihostHostFD && "close only supported for host fd");
++  int host_fd = fd_map[guest_fd].host_fd;
++  deallocate_fd_mapping(guest_fd);
++
++  // do not close standard streams
++  if (host_fd == STDIN_FILENO || host_fd == term_fd || host_fd == term_fd_err) {
++    print_semihost_syscall("\tNot closing host file because it is a sim standard stream.");
++    return 0;
++  }
++
++  int return_value = close(fd_map[guest_fd].host_fd);
++  if (return_value == -1) guest_errno = errno;
++  return return_value;
++}
++
++unsigned long plat_semihost_time_impl(void)
++{
++  time_t current_time = time(NULL);
++  if (current_time == -1) {
++    guest_errno = errno;
++    return 0;
++  }
++  assert(current_time >= 0 && "Negative time returned!");
++  return (unsigned long) current_time;
++}
++
++// returns length of argument string (excluding NULL terminator), -1 on error
++int plat_semihost_get_cmdline_impl(char * arg_buffer, int arg_buffer_len)
++{
++  print_semihost_syscall("Supplying command line args:");
++  if (cmdline_args == NULL) {
++    print_semihost_syscall("\t(Command line args empty)");
++    return 0;
++  }
++  strncpy(arg_buffer, cmdline_args, arg_buffer_len);
++
++  int arg_len;
++  // check if null byte present, if not set manually
++  if (arg_buffer[arg_buffer_len-1]) {
++    arg_buffer[arg_buffer_len-1] = '\0';
++    arg_len =  arg_buffer_len - 1; // also implies string has max length
++  } else
++    arg_len = strnlen(arg_buffer, arg_buffer_len);
++  print_semihost_syscall("\t\"%s\" (length: %d)", arg_buffer, arg_len);
++  return arg_len;
++}
++
++void plat_semihost_args_prepend(char* new_arg)
++{
++  char *old_args = cmdline_args;
++  cmdline_args = strdup(new_arg);
++  if (!old_args) return;
++
++  int new_len = strlen(cmdline_args) + strlen(old_args) + 2;
++  assert((cmdline_args = realloc(cmdline_args, new_len)));
++  strcat(cmdline_args, " ");
++  strcat(cmdline_args, old_args);
++  free(old_args);
++}
+diff --git a/c_emulator/riscv_platform_impl.h b/c_emulator/riscv_platform_impl.h
+index e3e4a967..5751ae25 100644
+--- a/c_emulator/riscv_platform_impl.h
++++ b/c_emulator/riscv_platform_impl.h
+@@ -21,6 +21,8 @@ extern bool rv_enable_dirty_update;
+ extern bool rv_enable_misaligned;
+ extern bool rv_mtval_has_illegal_inst_bits;
+ extern bool rv_enable_writable_fiom;
++extern bool rv_enable_semihosting;
++extern char *cmdline_args;
+ 
+ extern uint64_t rv_ram_base;
+ extern uint64_t rv_ram_size;
+@@ -40,3 +42,23 @@ extern uint64_t rv_insns_per_tick;
+ extern FILE *trace_log;
+ extern int term_fd;
+ void plat_term_write_impl(char c);
++extern int term_fd_err;
++
++typedef int SemihostGuestFD;
++
++void print_semihost_syscall(char*, ...);
++void print_semihost_failure(int);
++
++void plat_semihost_init(void);
++int plat_semihost_open_impl(char*, int, int);
++void plat_semihost_exit_impl(int, int);
++int plat_semihost_flen_impl(SemihostGuestFD);
++int plat_semihost_istty_impl(SemihostGuestFD);
++int plat_semihost_write_impl(SemihostGuestFD, char*, int);
++int plat_semihost_read_impl(SemihostGuestFD, char*, int);
++int plat_semihost_errno_impl();
++int plat_semihost_seek_impl(SemihostGuestFD, int);
++int plat_semihost_close_impl(SemihostGuestFD);
++unsigned long plat_semihost_time_impl(void);
++int plat_semihost_get_cmdline_impl(char *, int);
++void plat_semihost_args_prepend(char *);
+diff --git a/c_emulator/riscv_semihosting.h b/c_emulator/riscv_semihosting.h
+new file mode 100644
+index 00000000..db95f88f
+--- /dev/null
++++ b/c_emulator/riscv_semihosting.h
+@@ -0,0 +1,25 @@
++#ifndef RISCV_SEMIHOSTING_H_
++#define RISCV_SEMIHOSTING_H_
++
++typedef enum {
++  RISCV_SYS_OPEN = 0x01,
++  RISCV_SYS_CLOSE = 0x02,
++  RISCV_SYS_WRITE = 0x05,
++  RISCV_SYS_READ = 0x06,
++  RISCV_SYS_ISTTY = 0x09,
++  RISCV_SYS_SEEK = 0x0A,
++  RISCV_SYS_FLEN = 0x0C,
++  RISCV_SYS_TIME = 0x11,
++  RISCV_SYS_ERRNO = 0x13,
++  RISCV_SYS_GET_CMDLINE = 0x15,
++  RISCV_SYS_EXIT = 0x18
++} riscv_semihosting_op;
++
++typedef enum {
++  ADP_Stopped_AddressException = 0x20005,
++  ADP_Stopped_ApplicationExit = 0x20026
++} riscv_semihosting_exit_codes;
++
++const char *syscall_to_string(riscv_semihosting_op);
++
++#endif // RISCV_SEMIHOSTING_H_
+diff --git a/c_emulator/riscv_sim.c b/c_emulator/riscv_sim.c
+index f3c63435..93fbbc63 100644
+--- a/c_emulator/riscv_sim.c
++++ b/c_emulator/riscv_sim.c
+@@ -12,8 +12,10 @@
+ #include <sys/socket.h>
+ #include <netinet/ip.h>
+ #include <fcntl.h>
++#include <assert.h>
+ 
+ #include "elf.h"
++#include "riscv_config.h"
+ #include "sail.h"
+ #include "rts.h"
+ #ifdef SAILCOV
+@@ -53,11 +55,14 @@ const char *RV32ISA = "RV32IMAC";
+ #define OPT_ENABLE_WRITABLE_FIOM 1001
+ #define OPT_PMP_COUNT 1002
+ #define OPT_PMP_GRAIN 1003
++#define OPT_CMDLINE_ARGS 1004
++#define OPT_TERMINAL_ERR_LOG 1005
+ 
+ static bool do_dump_dts = false;
+ static bool do_show_times = false;
+ struct tv_spike_t *s = NULL;
+ char *term_log = NULL;
++char *term_log_err = NULL;
+ static const char *trace_log_path = NULL;
+ FILE *trace_log = NULL;
+ char *dtb_file = NULL;
+@@ -85,6 +90,7 @@ bool config_print_reg = true;
+ bool config_print_mem_access = true;
+ bool config_print_platform = true;
+ bool config_print_rvfi = false;
++bool config_print_semihosting = true;
+ 
+ void set_config_print(char *var, bool val)
+ {
+@@ -94,6 +100,7 @@ void set_config_print(char *var, bool val)
+     config_print_reg = val;
+     config_print_platform = val;
+     config_print_rvfi = val;
++    config_print_semihosting = val;
+   } else if (strcmp("instr", var) == 0) {
+     config_print_instr = val;
+   } else if (strcmp("reg", var) == 0) {
+@@ -104,6 +111,8 @@ void set_config_print(char *var, bool val)
+     config_print_rvfi = val;
+   } else if (strcmp("platform", var) == 0) {
+     config_print_platform = val;
++  } else if (strcmp("semihosting", var) == 0) {
++    config_print_semihosting = val;
+   } else {
+     fprintf(stderr, "Unknown trace category: '%s' (should be %s)\n",
+             "instr|reg|mem|platform|all", var);
+@@ -148,6 +157,9 @@ static struct option options[] = {
+ #ifdef SAILCOV
+     {"sailcov-file",                required_argument, 0, 'c'                     },
+ #endif
++    {"enable-semihosting",          no_argument,       0, 'S'                     },
++    {"cmdline-args",                required_argument, 0, OPT_CMDLINE_ARGS        },
++    {"terminal-err-log",            required_argument, 0, OPT_TERMINAL_ERR_LOG    },
+     {0,                             0,                 0, 0                       }
+ };
+ 
+@@ -270,7 +282,8 @@ static int process_args(int argc, char **argv)
+                     "V::"
+                     "v::"
+                     "l:"
+-                    "x",
++                    "x"
++                    "S",
+                     options, NULL);
+     if (c == -1)
+       break;
+@@ -400,6 +413,17 @@ static int process_args(int argc, char **argv)
+       trace_log_path = optarg;
+       fprintf(stderr, "using %s for trace output.\n", trace_log_path);
+       break;
++    case 'S':
++      rv_enable_semihosting = true;
++      break;
++    case OPT_CMDLINE_ARGS:
++      assert(rv_enable_semihosting);
++      cmdline_args = strdup(optarg);
++      break;
++    case OPT_TERMINAL_ERR_LOG:
++      term_log_err = strdup(optarg);
++      fprintf(stderr, "using %s for terminal stderr output\n", term_log_err);
++      break;
+     case '?':
+       print_usage(argv[0], 1);
+       break;
+@@ -455,11 +479,13 @@ uint64_t load_sail(char *f, bool main_file)
+   }
+   fprintf(stdout, "ELF Entry @ 0x%" PRIx64 "\n", entry);
+   /* locate htif ports */
+-  if (lookup_sym(f, "tohost", &rv_htif_tohost) < 0) {
++  bool tohost_found = lookup_sym(f, "tohost", &rv_htif_tohost) >= 0;
++  if (!rv_enable_semihosting && !tohost_found) {
+     fprintf(stderr, "Unable to locate htif tohost port.\n");
+     exit(1);
+   }
+-  fprintf(stderr, "tohost located at 0x%0" PRIx64 "\n", rv_htif_tohost);
++  if (tohost_found)
++    fprintf(stderr, "tohost located at 0x%0" PRIx64 "\n", rv_htif_tohost);
+   /* locate test-signature locations if any */
+   if (!lookup_sym(f, "begin_signature", &begin_sig)) {
+     fprintf(stdout, "begin_signature: 0x%0" PRIx64 "\n", begin_sig);
+@@ -1071,6 +1097,15 @@ void init_logs()
+     exit(1);
+   }
+ 
++  if (term_log_err != NULL
++      && (term_fd_err = open(term_log_err, O_WRONLY | O_CREAT | O_TRUNC,
++                         S_IRUSR | S_IRGRP | S_IROTH | S_IWUSR))
++          < 0) {
++    fprintf(stderr, "Cannot create terminal error log '%s': %s\n", term_log_err,
++            strerror(errno));
++    exit(1);
++  }
++
+ #ifdef SAILCOV
+   if (sailcov_file != NULL) {
+     sail_set_coverage_file(sailcov_file);
+@@ -1166,6 +1201,11 @@ int main(int argc, char **argv)
+   init_spike(initial_elf_file, entry, rv_ram_size);
+   init_sail(entry);
+ 
++  if (rv_enable_semihosting){
++    plat_semihost_init();
++    plat_semihost_args_prepend(initial_elf_file);
++  }
++
+   if (!init_check(s))
+     finish(1);
+ 
+diff --git a/c_emulator/riscv_trace.h b/c_emulator/riscv_trace.h
+new file mode 100644
+index 00000000..39569289
+--- /dev/null
++++ b/c_emulator/riscv_trace.h
+@@ -0,0 +1,29 @@
++#pragma once
++
++#include <stdint.h>
++
++typedef struct RISCVTraceInst {
++    uint32_t opcode;
++    char mnemonic[14];
++    char operands[14];
++} RISCVTraceInst;
++
++enum RISCVTraceMemAccessType {
++    Execute,
++    Read,
++    ReadWrite,
++    Write
++};
++
++typedef struct RISCVTraceMemOp {
++    uint64_t addr;
++    uint8_t size;
++    enum RISCVTraceMemAccessType access_type;
++    bool tag;
++} RISCVTraceMemOp;
++
++typedef struct RISCVTraceTick {
++    uint64_t index;
++    RISCVTraceInst inst;
++    RISCVTraceMemOp memops[4];
++} RISCVTraceTick;
+\ No newline at end of file
+diff --git a/model/riscv_insts_base.sail b/model/riscv_insts_base.sail
+index caea73a4..23157a90 100644
+--- a/model/riscv_insts_base.sail
++++ b/model/riscv_insts_base.sail
+@@ -743,16 +743,68 @@ function clause execute SRET() = {
+ mapping clause assembly = SRET() <-> "sret"
+ 
+ /* ****************************************************************** */
++
++val is_ebreak_for_semihosting : xlenbits -> option(bool)
++function is_ebreak_for_semihosting(current_pc) = {
++  /* Read instruction before and after current PC to check if they match the
++     NOPs specified in the semihosting spec.
++     TODO: add check filtering out address translation */
++  let pc_before = current_pc - 4;
++  let pc_after = current_pc + 4;
++  match mem_read(Execute(), pc_before, 4, false, false, false) {
++    MemException(_) => None(),
++    MemValue(inst_before) => {
++      if encdec(inst_before) == SHIFTIOP(0b01_1111, 0b00000, 0b00000, RISCV_SLLI) then
++        match mem_read(Execute(), pc_after, 4, false, false, false) {
++          MemException(_) => None(),
++          MemValue(inst_after) => {
++            if encdec(inst_after) == SHIFTIOP(0b00_0111, 0b00000, 0b00000, RISCV_SRAI) then Some(true)
++            else Some(false)
++          }
++        }
++      else Some(false)
++    }
++  }
++}
++
++val handle_semihosting : unit -> Retired effect { escape }
++function handle_semihosting() = {
++  let next_pc = get_next_pc() + 4;
++  match ext_control_check_pc(next_pc) {
++    Ext_ControlAddr_Error(e) => {
++      ext_handle_control_check_error(e);
++      RETIRE_FAIL
++    },
++    Ext_ControlAddr_OK(target) => {
++      set_next_pc(target);
++      let op_number = X(reg_name("a0"));
++      let parameter_ptr = X(reg_name("a1"));
++      let return_val = plat_handle_semihosting(op_number, parameter_ptr);
++      X(reg_name("a0")) = return_val;
++      RETIRE_SUCCESS
++    }
++  }
++}
++
+ union clause ast = EBREAK : unit
+ 
+ mapping clause encdec = EBREAK()
+   <-> 0b000000000001 @ 0b00000 @ 0b000 @ 0b00000 @ 0b1110011
+ 
+ function clause execute EBREAK() = {
+-  handle_mem_exception(PC, E_Breakpoint());
+-  RETIRE_FAIL
++  let is_semihosting_ebreak = if plat_enable_semihosting() then is_ebreak_for_semihosting(PC) else None();
++  match is_semihosting_ebreak {
++    Some(true) => {
++      handle_semihosting()
++    },
++    _ => {
++      handle_mem_exception(PC, E_Breakpoint());
++      RETIRE_FAIL
++    }
++  }
+ }
+ 
++
+ mapping clause assembly = EBREAK() <-> "ebreak"
+ 
+ /* ****************************************************************** */
+diff --git a/model/riscv_platform.sail b/model/riscv_platform.sail
+index 9f38090a..bb22a7f4 100644
+--- a/model/riscv_platform.sail
++++ b/model/riscv_platform.sail
+@@ -50,6 +50,8 @@ val plat_mtval_has_illegal_inst_bits = {ocaml: "Platform.mtval_has_illegal_inst_
+                                         c: "plat_mtval_has_illegal_inst_bits",
+                                         lem: "plat_mtval_has_illegal_inst_bits"} : unit -> bool
+ 
++
++
+ /* ROM holding reset vector and device-tree DTB */
+ val plat_rom_base   = {ocaml: "Platform.rom_base", interpreter: "Platform.rom_base", c: "plat_rom_base", lem: "plat_rom_base"} : unit -> xlenbits
+ val plat_rom_size   = {ocaml: "Platform.rom_size", interpreter: "Platform.rom_size", c: "plat_rom_size", lem: "plat_rom_size"} : unit -> xlenbits
+@@ -454,3 +456,7 @@ function platform_wfi() -> unit = {
+     mcycle = mtimecmp;
+   }
+ }
++
++val plat_handle_semihosting = {c: "plat_handle_semihosting"} : (xlenbits, xlenbits) -> xlenbits
++val plat_enable_semihosting = {c: "plat_enable_semihosting"} : unit -> bool
++function plat_enable_semihosting() = false
+diff --git a/test/semihosting/basic.S b/test/semihosting/basic.S
+new file mode 100644
+index 00000000..b9fd69e2
+--- /dev/null
++++ b/test/semihosting/basic.S
+@@ -0,0 +1,17 @@
++    .global main
++main:
++    li a0, 0x01
++    li a1, 0x80010000
++    la t0, filename
++    sd t0, 0(a1)
++    li t0, 42
++    sd t0, 8(a1)
++    li t0, 10
++    sd t0, 16(a1)
++    slli x0, x0, 0x1f
++    ebreak
++    srai x0, x0, 0x7
++    ret
++
++filename:
++    .string "test file"
+diff --git a/test/semihosting/test_cmdline.c b/test/semihosting/test_cmdline.c
+new file mode 100644
+index 00000000..087e1fb0
+--- /dev/null
++++ b/test/semihosting/test_cmdline.c
+@@ -0,0 +1,12 @@
++#include <stdio.h>
++
++int main(int argc, char **argv)
++{
++    printf("Argc: %d\n", argc);
++    printf("Argv: %p\n", argv);
++    for (int argi = 0; argi < argc; argi++)
++    {
++        printf("Argument %d,%p: '%s'\n", argi, argv[argi], argv[argi]);
++    }
++    return 0;
++}
+diff --git a/test/semihosting/test_exception.c b/test/semihosting/test_exception.c
+new file mode 100644
+index 00000000..cb05291f
+--- /dev/null
++++ b/test/semihosting/test_exception.c
+@@ -0,0 +1,11 @@
++#include <stdio.h>
++
++static int test[2];
++
++int main()
++{
++    for(int i = 0;;i++) {
++        printf("%d: %d\n", i, test[i]);
++    }
++    return 0;
++}
+\ No newline at end of file
+diff --git a/test/semihosting/test_exit.c b/test/semihosting/test_exit.c
+new file mode 100644
+index 00000000..84eb8ea1
+--- /dev/null
++++ b/test/semihosting/test_exit.c
+@@ -0,0 +1,3 @@
++int main() {
++    return 1;
++}
+\ No newline at end of file
+diff --git a/test/semihosting/test_open.c b/test/semihosting/test_open.c
+new file mode 100644
+index 00000000..4535bca6
+--- /dev/null
++++ b/test/semihosting/test_open.c
+@@ -0,0 +1,16 @@
++#include <stdio.h>
++#include <errno.h>
++#include <unistd.h>
++
++int main( void )
++{
++    FILE *file = fopen("test_open.c", "r");
++    char buffer[32];
++    if (file == NULL) perror("Error");
++    else {
++        fgets(buffer, 32, file);
++        printf("%s\n", buffer);
++    }
++    fclose(file);
++    return 0;
++}
+diff --git a/test/semihosting/test_read.c b/test/semihosting/test_read.c
+new file mode 100644
+index 00000000..d0a30f0a
+--- /dev/null
++++ b/test/semihosting/test_read.c
+@@ -0,0 +1,10 @@
++#include <stdio.h>
++
++int main(void)
++{
++    char buf[32];
++    printf("Tell me something: ");
++    fgets(buf, 32, stdin);
++    printf("\nYou said: %s\n", buf);
++    return 0;
++}
+\ No newline at end of file
+diff --git a/test/semihosting/test_time.c b/test/semihosting/test_time.c
+new file mode 100644
+index 00000000..9d0def16
+--- /dev/null
++++ b/test/semihosting/test_time.c
+@@ -0,0 +1,17 @@
++#include <stdio.h>
++#include <sys/timeb.h>
++
++extern int _ftime (struct timeb *);
++
++int main()
++{
++    struct timeb before_time;
++    struct timeb after_time;
++    _ftime(&before_time);
++    do {
++        for (int i = 0; i < 100000; i++);
++        _ftime(&after_time);
++    } while (after_time.time - before_time.time < 5);
++    printf("Elapsed time: %ld", after_time.time - before_time.time);
++    return 0;
++}
+diff --git a/test/semihosting/test_write.c b/test/semihosting/test_write.c
+new file mode 100644
+index 00000000..3b6da385
+--- /dev/null
++++ b/test/semihosting/test_write.c
+@@ -0,0 +1,8 @@
++#include <stdio.h>
++
++int main(void)
++{
++    printf("Hello, world!\n");
++    fprintf(stderr, "Hello, world!\n");
++    return 0;
++}
+\ No newline at end of file

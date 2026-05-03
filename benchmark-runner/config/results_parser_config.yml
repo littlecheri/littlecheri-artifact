@@ -1,0 +1,18 @@
+---
+output_stats:
+  - "revoc"
+  - "encap"
+  - "clearregs"
+  - "benchmark"
+  - "simSeconds"
+  - "simTicks"
+  - "system.cpu.cpi"
+  - "sail.Instructions"
+  - "stack_size"
+  - "guest.stack.pressure"
+  - "secureCalls"
+  - "binary_size"
+  - "guest.stack.cumulativeAllocation"
+  - "reserve"
+  - "reducecsr"
+...

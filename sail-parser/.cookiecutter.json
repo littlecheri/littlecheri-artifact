@@ -1,0 +1,16 @@
+{
+  "_checkout": "2022.6.3",
+  "_output_dir": "/home/elias/Documents/Research/uninit-benchmarking/tools",
+  "_repo_dir": "/home/elias/.cookiecutters/cookiecutter-hypermodern-python",
+  "_template": "gh:cjolowicz/cookiecutter-hypermodern-python",
+  "author": "Elias Storme",
+  "copyright_year": "2024",
+  "development_status": "Development Status :: 1 - Planning",
+  "email": "elias.storme@kuleuven.be",
+  "friendly_name": "Sail Parser",
+  "github_user": "stormeuh",
+  "license": "MIT",
+  "package_name": "sail_parser",
+  "project_name": "sail-parser",
+  "version": "0.2.0"
+}

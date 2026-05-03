@@ -1,0 +1,21 @@
+clean: false
+
+build_dir: "builds"
+sysroots_scripts: "sysroots/scripts"
+
+sysrootnames:
+  - "none"
+  - "uninit"
+  - "uninitreserve"
+  - "uninitreservereduce"
+
+sources:
+  llvm-project:
+    llvm: "llvm"
+    compiler_rt: "compiler-rt/lib/builtins"
+
+llvm_executables:
+  - "clang"
+  - "clang++"
+  - "ld.lld"
+  - "llvm-objdump"

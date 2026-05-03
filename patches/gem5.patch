@@ -1,0 +1,211 @@
+diff --git a/configs/example/etrace_replay.py b/configs/example/etrace_replay.py
+index 7df1333f2b..753a3e6451 100644
+--- a/configs/example/etrace_replay.py
++++ b/configs/example/etrace_replay.py
+@@ -45,6 +45,7 @@ from m5.util import (
+ addToPath("../")
+ 
+ from common import (
++    CacheConfig,
+     MemConfig,
+     Options,
+     Simulation,
+@@ -62,6 +63,9 @@ def config_cache(args, system):
+     system.l1i = L1_ICache(**_get_cache_opts("l1i", args))
+     system.l1d = L1_DCache(**_get_cache_opts("l1d", args))
+ 
++    system.l1i.clk_domain = system.cpu_clk_domain
++    system.l1d.clk_domain = system.cpu_clk_domain
++
+     system.cpu.dcache_port = system.l1d.cpu_side
+     system.cpu.icache_port = system.l1i.cpu_side
+ 
+@@ -101,6 +105,7 @@ if args.num_cpus > 1:
+ 
+ system = System(
+     mem_mode=TraceCPU.memory_mode(),
++    # mem_ranges=[AddrRange(0x80000000, size=args.mem_size)],
+     mem_ranges=[AddrRange(args.mem_size)],
+     cache_line_size=args.cacheline_size,
+ )
+diff --git a/src/base/random.cc b/src/base/random.cc
+index 19815e4009..6196e42cb2 100644
+--- a/src/base/random.cc
++++ b/src/base/random.cc
+@@ -41,6 +41,7 @@
+ #include "base/random.hh"
+ 
+ #include <sstream>
++#include <algorithm>
+ 
+ namespace gem5
+ {
+diff --git a/src/cpu/trace/trace_cpu.cc b/src/cpu/trace/trace_cpu.cc
+index 336a13beda..4332830ac3 100644
+--- a/src/cpu/trace/trace_cpu.cc
++++ b/src/cpu/trace/trace_cpu.cc
+@@ -147,11 +147,13 @@ TraceCPU::schedIcacheNext()
+     bool sched_next = icacheGen.tryNext();
+     // If packet sent successfully, schedule next event
+     if (sched_next) {
+-        DPRINTF(TraceCPUInst,
+-                "Scheduling next icacheGen event at %d.\n",
+-                curTick() + icacheGen.tickDelta());
+-        schedule(icacheNextEvent, curTick() + icacheGen.tickDelta());
+-        ++traceStats.numSchedIcacheEvent;
++        // Next events get scheduled by cache timing request now
++
++        // DPRINTF(TraceCPUInst,
++        //         "Scheduling next icacheGen event at %d.\n",
++        //         curTick() + icacheGen.tickDelta());
++        // schedule(icacheNextEvent, curTick() + icacheGen.tickDelta());
++        // ++traceStats.numSchedIcacheEvent;
+     } else {
+         // check if traceComplete. If not, do nothing because sending failed
+         // and next event will be scheduled via RecvRetry()
+@@ -264,6 +266,11 @@ TraceCPU::ElasticDataGen::init()
+     if (debug::TraceCPUData) {
+         printReadyList();
+     }
++    if (readyList.empty()) {
++        DPRINTF(TraceCPUData,
++            "readyList empty, scheduling next event now.\n");
++        return curTick();
++    }
+     auto free_itr = readyList.begin();
+     DPRINTF(TraceCPUData,
+             "Execute tick of the first dependency free node %lli is %d.\n",
+@@ -650,8 +657,11 @@ TraceCPU::ElasticDataGen::checkAndIssue(const GraphNode* node_ptr, bool first)
+                 node_ptr->robNum);
+     }
+ 
++    bool fetchPending = isNodeFetchDepFree(node_ptr);
++
+     // Check if resources are available to issue the specific node
+-    if (hwResource.isAvailable(node_ptr)) {
++    // Also check if the node's instruction has been fetched.
++    if (hwResource.isAvailable(node_ptr) && fetchPending) {
+         // If resources are free only then add to readyList
+         DPRINTFR(TraceCPUData, "\t\tResources available for seq. num %lli. "
+                 "Adding to readyList, occupying resources.\n",
+@@ -664,14 +674,16 @@ TraceCPU::ElasticDataGen::checkAndIssue(const GraphNode* node_ptr, bool first)
+         hwResource.occupy(node_ptr);
+         return true;
+     } else {
++        auto msg = fetchPending ?
++            "Resources unavailable" : "Instruction fetch pending";
+         if (first) {
+             // Although dependencies are complete, resources are not available.
+-            DPRINTFR(TraceCPUData, "\t\tResources unavailable for seq. num "
+-                    "%lli. Adding to depFreeQueue.\n", node_ptr->seqNum);
++            DPRINTFR(TraceCPUData, "\t\t%s for seq. num "
++                    "%lli. Adding to depFreeQueue.\n", msg, node_ptr->seqNum);
+             depFreeQueue.push(node_ptr);
+         } else {
+-            DPRINTFR(TraceCPUData, "\t\tResources unavailable for seq. num "
+-                    "%lli. Still pending issue.\n", node_ptr->seqNum);
++            DPRINTFR(TraceCPUData, "\t\t%s for seq. num "
++                    "%lli. Still pending issue.\n", msg, node_ptr->seqNum);
+         }
+         return false;
+     }
+@@ -1146,6 +1158,16 @@ TraceCPU::schedDcacheNextEvent(Tick when)
+ 
+ }
+ 
++void
++TraceCPU::schedIcacheNextEvent()
++{
++    DPRINTF(TraceCPUInst,
++            "Scheduling next icacheGen event at %d.\n",
++            clockEdge());// + icacheGen.tickDelta());
++    schedule(icacheNextEvent, clockEdge());// + icacheGen.tickDelta());
++    ++traceStats.numSchedIcacheEvent;
++}
++
+ Port &
+ TraceCPU::getPort(const std::string &if_name, PortID idx)
+ {
+@@ -1163,6 +1185,8 @@ TraceCPU::getPort(const std::string &if_name, PortID idx)
+ bool
+ TraceCPU::IcachePort::recvTimingResp(PacketPtr pkt)
+ {
++    DPRINTF(TraceCPUInst,"Received fetch response %#x\n", pkt->getAddr());
++    owner->schedIcacheNextEvent();
+     // All responses on the instruction fetch side are ignored. Simply delete
+     // the packet to free allocated memory
+     delete pkt;
+@@ -1334,6 +1358,13 @@ TraceCPU::ElasticDataGen::GraphNode::removeRobDep(NodeSeqNum rob_dep)
+     return false;
+ }
+ 
++bool
++TraceCPU::ElasticDataGen::isNodeFetchDepFree(const GraphNode* node_ptr)
++{
++    FixedRetryGen *inst_gen = &owner.icacheGen;
++    return inst_gen->isInstFetched(node_ptr->seqNum);
++}
++
+ bool
+ TraceCPU::ElasticDataGen::GraphNode::removeDepOnInst(NodeSeqNum done_seq_num)
+ {
+@@ -1418,6 +1449,7 @@ TraceCPU::FixedRetryGen::InputStream::read(TraceElement* element)
+         element->tick = pkt_msg.tick();
+         element->flags = pkt_msg.has_flags() ? pkt_msg.flags() : 0;
+         element->pc = pkt_msg.has_pc() ? pkt_msg.pc() : 0;
++        element->seqNum = pkt_msg.has_pkt_id() ? pkt_msg.pkt_id() : 0;
+         return true;
+     }
+ 
+diff --git a/src/cpu/trace/trace_cpu.hh b/src/cpu/trace/trace_cpu.hh
+index c7fd804351..e0db3c3ef1 100644
+--- a/src/cpu/trace/trace_cpu.hh
++++ b/src/cpu/trace/trace_cpu.hh
+@@ -190,6 +190,11 @@ class TraceCPU : public ClockedObject
+      */
+     void schedDcacheNextEvent(Tick when);
+ 
++    /**
++     *
++     */
++    void schedIcacheNextEvent();
++
+   protected:
+ 
+     /**
+@@ -313,6 +318,7 @@ class TraceCPU : public ClockedObject
+     {
+ 
+       private:
++        typedef uint64_t NodeSeqNum;
+ 
+         /**
+          * This struct stores a line in the trace file.
+@@ -338,6 +344,8 @@ class TraceCPU : public ClockedObject
+             /** Instruction PC */
+             Addr pc;
+ 
++            NodeSeqNum seqNum;
++
+             /**
+              * Check validity of this element.
+              *
+@@ -460,6 +468,9 @@ class TraceCPU : public ClockedObject
+ 
+         int64_t tickDelta() { return delta; }
+ 
++        bool isInstFetched(NodeSeqNum seqNum)
++          { return currElement.seqNum >= seqNum; }
++
+       private:
+         /** Reference of the TraceCPU. */
+         TraceCPU& owner;
+@@ -628,6 +639,8 @@ class TraceCPU : public ClockedObject
+             std::string typeToStr() const;
+         };
+ 
++        bool isNodeFetchDepFree(const GraphNode* node_ptr);
++
+         /** Struct to store a ready-to-execute node and its execution tick. */
+         struct ReadyNode
+         {

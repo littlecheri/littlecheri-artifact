@@ -1,0 +1,167 @@
+from snakemake.utils import min_version
+min_version("6.0")
+
+wildcard_constraints:
+    run_idx=r"\d+",
+    case_name=r"\w+",
+    abi=r"none|uninit",
+
+configfile: "config/config.yaml"
+configfile: "config/local_config.yaml"
+
+rule all:
+    input: f"{config['run_output']}/results.csv"
+
+pathvars:
+    run_dir="runs/{run_id}",
+    variant="{revoc}/{reserve}/{encap}/{clearregs}/{reducecsr}",
+    parent_dir="<run_dir>/<variant>",
+    binary_dir="<parent_dir>/binaries/{stack_size}",
+    trace_file_prefix="<parent_dir>/traces/{benchmark}_{stack_size}",
+    sail_dir="<parent_dir>/sail/{benchmark}_{stack_size}",
+    instrumentation_dir="<run_dir>/instrumentation/{benchmark}"
+
+include: "sysroots/sysroots.smk"
+include: "utility.smk"
+
+
+rule run_sail_output_gem5:
+    input: 
+        binary="<binary_dir>/{benchmark}.elf"
+    output:
+        data=temp("<trace_file_prefix>_data.proto.gz", group_jobs=True),
+        inst=temp("<trace_file_prefix>_inst.proto.gz", group_jobs=True),
+        stats="<sail_dir>/parser_stats.txt",
+    params:
+        sail_options="-S -p -Vall -vmem -vinstr -vreg",
+        cmdline_args=""
+    log: 
+        stdout="<sail_dir>/sail.out",
+        stderr="<sail_dir>/sail.err",
+        parser="<sail_dir>/parser.out"
+    threads: 2
+    shell: "{config[sail_sim]} -z 1024 {params.sail_options} --cmdline-args '{params.cmdline_args}' {input.binary} -t {log.stdout} --trace-output /dev/stdout 2> {log.stderr}"
+        + " | "
+        + "{config[sail_parser]} output-proto --count-cshrink -c - {output.data} {output.inst} {output.stats} > {log.parser}"
+
+rule run_gem5:
+    input:
+        data="{case}/traces/{benchmark}_{stack_size}_data.proto.gz",
+        inst="{case}/traces/{benchmark}_{stack_size}_inst.proto.gz",
+    output:
+        gem5=directory("{case}/gem5/{benchmark}_{stack_size}"),
+        stats="{case}/gem5/{benchmark}_{stack_size}/stats.txt"
+    params:
+        script_args=lambda w, input: config["gem5"]["script_default_args"] + [
+            "--data-trace-file={}".format(input.data),
+            "--inst-trace-file={}".format(input.inst)
+        ]
+    log: "{case}/gem5/{benchmark}_{stack_size}/log.txt"
+    shell: "{config[gem5][executable]} --outdir={output.gem5} {config[gem5][script]} {params.script_args} &> {log}"
+
+rule sail_stats:
+    input: "{case}/sail/{benchmark}_{stack_size}/sail.err"
+    output: "{case}/sail/{benchmark}_{stack_size}/sail_stats.txt"
+    shell: "scripts/sail_stats.sh {input} > {output}"
+
+shell.prefix("set -o pipefail;")
+
+rule calculate_binary_stats:
+    input: "<binary_dir>/{benchmark}.elf"
+    output: "<binary_dir>/{benchmark}{suffix}_binary_stats.txt"
+    wildcard_constraints:
+        benchmark="coremark|libc-bench|random-callstack-ubench(-(large|small)-alloc)?",
+        suffix=".*"
+    shell: """llvm-size {input} --format=sysv | awk '/^\\.text/{{print "binary_size       " $2 "      # size of the binary"}}' > {output}"""
+
+rule combine_stats:
+    input:
+        metadata="<parent_dir>/metadata_{stack_size}.txt",
+        gem5_stats="<parent_dir>/gem5/{benchmark}_{stack_size}/stats.txt",
+        parser_stats="<sail_dir>/parser_stats.txt",
+        sail_stats="<sail_dir>/sail_stats.txt",
+        instrumentation="<instrumentation_dir>/instrumentation.txt",
+        binary_stats="<binary_dir>/{benchmark}_binary_stats.txt",
+    output: "<parent_dir>/stats/{benchmark}_{stack_size}.txt"
+    shell: """
+    echo 'benchmark         {wildcards.benchmark}         # Benchmark' >> {output}
+    cat {input.metadata} {input.parser_stats} {input.sail_stats} {input.instrumentation} {input.gem5_stats} {input.binary_stats} >> {output}
+    """
+
+rule case_metadata:
+    output: "runs/{run_id}/{revoc}/{reserve}/{encap}/{clearregs}/{reducecsr}/metadata_{stack_size}.txt"
+    shell: """ echo 'revoc         {wildcards.revoc}         # Stack revocation mechanism
+reserve        {wildcards.reserve}       # Use reserve stack
+encap          {wildcards.encap}         # Return encapsulation mechanism
+clearregs      {wildcards.clearregs}         # Clear regs on secure call
+reducecsr      {wildcards.reducecsr}         # Reduce callee-saved registers for regular calls
+stack_size     {wildcards.stack_size}    # Total size of the stack' > {output}
+    """
+
+def option_entry_is(option, key, value) -> bool:
+    for (ok,ov) in option:
+        if ok == key: return ov == value
+
+from itertools import product
+def benchmark_option_filter_combinator(*args, **kwargs):
+    for option in product(*args, **kwargs):
+        if (option_entry_is(option, "revoc", "none") and 
+            not option_entry_is(option, "reserve", "none")): 
+            continue
+        if (option_entry_is(option, "revoc", "none") and
+            not option_entry_is(option, "encap", "none")): 
+            continue
+        if (option_entry_is(option, "encap", "none") and
+            not option_entry_is(option, "clearregs", "noclear")): 
+            continue
+        if (option_entry_is(option, "reducecsr", "noreduce")
+           and not (option_entry_is(option, "encap", "isentry") 
+           and option_entry_is(option, "clearregs", "clear"))): continue
+        # print(option)
+        yield option
+
+def standard_cases(wildcards):
+    return expand("runs/{run_id}/{revoc}/{reserve}/{encap}/{clearregs}/{reducecsr}", 
+            benchmark_option_filter_combinator,
+            run_id=wildcards.run_id, 
+            revoc=config["revocation_options"], 
+            reserve=config["reserve_stack_options"], 
+            encap=config["encapsulation_options"],
+            clearregs=config["clear_options"],
+            reducecsr=config["reducecsr_options"])
+
+def benchmark_stats(wildcards):
+    output = []
+    if "coremark" in config["benchmarks"]:
+        output += expand("{case}/stats/coremark_8M.txt", case=standard_cases(wildcards))
+    if "libc-bench" in config["benchmarks"]:
+        output += expand("{case}/stats/libc-bench_{libcbench_part}_8M.txt", 
+            case=standard_cases(wildcards),
+            libcbench_part=config["libc-bench_parts"])
+    if "random-callstack-ubench" in config["benchmarks"]:
+        output += expand("{case}/stats/random-callstack-ubench-{secure_ratio}_8M.txt", 
+            case=standard_cases(wildcards),
+            secure_ratio=config["random-callstack-ubench_secure_ratios"]
+            )
+        output += expand("{case}/stats/random-callstack-ubench+large-alloc-{secure_ratio}_8M.txt", 
+            case=standard_cases(wildcards),
+            secure_ratio="0.5"
+            )
+        output += expand("{case}/stats/random-callstack-ubench+small-alloc-{secure_ratio}_8M.txt", 
+            case=standard_cases(wildcards),
+            secure_ratio="0.5"
+            )
+    return output
+
+rule condense_results:
+    input: benchmark_stats
+    output: "runs/{run_id}/results.csv"
+    log: "runs/{run_id}/results.log"
+    script: "scripts/results_parser.py"
+
+rule run_tests:
+    input: f"{config['run_output']}/results.csv"
+    output: directory("latest_run")
+    shell: f"ln -s {config['run_output']} latest_run"
+
+include: "benchmarks.smk"

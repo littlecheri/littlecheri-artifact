@@ -1,0 +1,953 @@
+diff --git a/Makefile b/Makefile
+index efda5c0..9559b0a 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,28 +1,70 @@
++OPATH := ./
+ 
+-SRCS = $(sort $(wildcard *.c))
+-OBJS = $(SRCS:.c=.o)
++SRCS = main.c
++SRCS += malloc.c 
++SRCS += regex.c
++SRCS += stdio.c
++SRCS += string.c
++SRCS += utf8.c
+ 
+-CFLAGS = -Os -D_XOPEN_SOURCE=700
+-LDFLAGS = -static
+-LIBS = -lpthread -lrt -lpthread
++ifeq ($(INSTRUMENT),1)
++OBJDIR = libc-bench-instrumented
++else
++OBJDIR = libc-bench
++endif
++OBJS = $(addprefix $(OPATH)$(OBJDIR)/,$(SRCS:.c=.o))
++.INTERMEDIATE: $(OBJS) $(OPATH)OBJDIR
+ 
++REVOC := none
++CHERI_ENCAP := none
++LINKER_SCRIPT = sail.ld
+ 
+-all: libc-bench
++CC=$(SDK_BIN)/clang
++COMMON_FLAGS=--target=riscv64-unknown-elf -march=rv64imaxcheri -mabi=l64pc128 --sysroot=$(SYSROOT_DIR) -mcmodel=medany -mrelax
++CFLAGS = $(COMMON_FLAGS) -O0 -std=gnu99 -fno-common -mllvm -cheri-uninit-return-encapsulation=$(CHERI_ENCAP) -g -mllvm -cheri-stack-revocation=$(REVOC) $(XCFLAGS)
++LDFLAGS = -static -fuse-ld=lld -T$(LINKER_SCRIPT) -B$(SDK_BIN) -nostartfiles -Wl,--verbose $(EXTRA_LDFLAGS)
++LIBS = -lgloss
+ 
+-clean:
+-	rm -f $(OBJS) libc-bench
++ifneq ($(CHERI_ENCAP),none)
++CFLAGS += -DWRAP_UNINIT
++SRCS += libc_wrappers.c
++endif
++
++ifeq ($(CLEAR), clear)
++CFLAGS+=-mllvm -cheri-uninit-clear-regs=true
++else
++CFLAGS+=-mllvm -cheri-uninit-clear-regs=false
++endif
+ 
+-test: all
+-	./libc-bench
++REDUCECSR ?= noreduce
+ 
+-relink:
+-	rm -f libc-bench
+-	make all
++ifeq ($(REDUCECSR), reduce)
++CFLAGS+=-mllvm -cheri-uninit-reduce-callee-saved-regs=true
++else
++CFLAGS+=-mllvm -cheri-uninit-reduce-callee-saved-regs=false
++endif
+ 
+-retest: relink test
++all: libc-bench.elf
+ 
+-libc-bench: $(OBJS)
+-	$(CC) $(LDFLAGS) -o $@ $(OBJS) $(LIBS)
++$(OPATH)$(OBJDIR):
++	mkdir -p $@
+ 
+-%.o: %.c
++$(OPATH)$(OBJDIR)/%.o: %.c $(OPATH)$(OBJDIR)
+ 	$(CC) $(CFLAGS) -c -o $@ $<
++
++$(OPATH)libc-bench.elf: $(OBJS)
++	$(CC) $(COMMON_FLAGS) $(LDFLAGS) -o $@ $^
++
++$(OPATH)libc-bench-instrumented.elf: CFLAGS += -DINSTRUMENT_UNINIT
++$(OPATH)libc-bench-instrumented.elf: $(OBJS)
++	$(CC) $(COMMON_FLAGS) $(LDFLAGS) -o $@ $^
++
++.PHONY : clean
++clean:
++	-rm $(OBJS)
++
++# libc-bench: $(OBJS)
++# 	$(CC) $(LDFLAGS) -o $@ $(OBJS) $(LIBS)
++
++# %.o: %.c
++# 	$(CC) $(CFLAGS) -c -o $@ $<
+diff --git a/libc_wrappers.c b/libc_wrappers.c
+new file mode 100644
+index 0000000..8f2545d
+--- /dev/null
++++ b/libc_wrappers.c
+@@ -0,0 +1,34 @@
++#include "libc_wrappers.h"
++
++/* general */
++UNINIT_WRAPPER_IMPL(void *, memcpy, void *__restrict, const void *__restrict, size_t)
++
++/* malloc */
++UNINIT_WRAPPER_IMPL(void *, malloc, size_t)
++UNINIT_WRAPPER_IMPL(void, free, void *)
++
++/* regex */
++UNINIT_WRAPPER_IMPL(int, regcomp, regex_t *__restrict, const char *__restrict, int)
++UNINIT_WRAPPER_IMPL(int, regexec, const regex_t *__restrict, const char *__restrict, size_t, regmatch_t *__restrict, int)
++UNINIT_WRAPPER_IMPL(void, regfree, regex_t *)
++UNINIT_WRAPPER_IMPL(char *, setlocale, int, const char *)
++
++/* string */
++UNINIT_WRAPPER_IMPL(char *, strstr, const char *, const char *)
++UNINIT_WRAPPER_IMPL(void *, memset, void *, int, size_t)
++UNINIT_WRAPPER_IMPL(char *, strchr, const char *, int)
++UNINIT_WRAPPER_IMPL(unsigned long, strlen, const char *)
++
++/* stdio */
++UNINIT_WRAPPER_IMPL(FILE *, tmpfile)
++UNINIT_WRAPPER_IMPL(int, putc, int, FILE *)
++UNINIT_WRAPPER_IMPL(int, fseeko, FILE *, off_t, int)
++UNINIT_WRAPPER_IMPL(int, getc, FILE *)
++UNINIT_WRAPPER_IMPL(int, fclose, FILE *)
++UNINIT_WRAPPER_IMPL(int, putc_unlocked, int, FILE *)
++UNINIT_WRAPPER_IMPL(int, getc_unlocked, FILE *)
++
++/* utf8 */
++UNINIT_WRAPPER_IMPL(int, strcmp, const char *, const char *)
++UNINIT_WRAPPER_IMPL(char *, nl_langinfo, nl_item)
++UNINIT_WRAPPER_IMPL(size_t, mbstowcs, wchar_t *restrict, const char *restrict, size_t)
+diff --git a/libc_wrappers.h b/libc_wrappers.h
+new file mode 100644
+index 0000000..fd95e6a
+--- /dev/null
++++ b/libc_wrappers.h
+@@ -0,0 +1,43 @@
++#pragma once
++#include <stdlib.h>
++#include <stdio.h>
++#include <string.h>
++#include <regex.h>
++#include <locale.h>
++#include <sys/types.h>
++#include <langinfo.h>
++#include <wchar.h>
++#include <wrap_uninit.h>
++
++/* general */
++UNINIT_WRAPPER_DECL(void *, memcpy, void *__restrict, const void *__restrict, size_t)
++
++/* malloc */
++UNINIT_WRAPPER_DECL(void *, malloc, size_t)
++UNINIT_WRAPPER_DECL(void, free, void *)
++
++/* regex */
++UNINIT_WRAPPER_DECL(int, regcomp, regex_t *__restrict, const char *__restrict, int)
++UNINIT_WRAPPER_DECL(int, regexec, const regex_t *__restrict, const char *__restrict, size_t, regmatch_t *__restrict, int)
++UNINIT_WRAPPER_DECL(void, regfree, regex_t *)
++UNINIT_WRAPPER_DECL(char *, setlocale, int, const char *)
++
++/* string */
++UNINIT_WRAPPER_DECL(char *, strstr, const char *, const char *)
++UNINIT_WRAPPER_DECL(void *, memset, void *, int, size_t)
++UNINIT_WRAPPER_DECL(char *, strchr, const char *, int)
++UNINIT_WRAPPER_DECL(unsigned long, strlen, const char *)
++
++/* stdio */
++UNINIT_WRAPPER_DECL(FILE *, tmpfile)
++UNINIT_WRAPPER_DECL(int, putc, int, FILE *)
++UNINIT_WRAPPER_DECL(int, fseeko, FILE *, off_t, int)
++UNINIT_WRAPPER_DECL(int, getc, FILE *)
++UNINIT_WRAPPER_DECL(int, fclose, FILE *)
++UNINIT_WRAPPER_DECL(int, putc_unlocked, int, FILE *)
++UNINIT_WRAPPER_DECL(int, getc_unlocked, FILE *)
++
++/* utf8 */
++UNINIT_WRAPPER_DECL(int, strcmp, const char *, const char *)
++UNINIT_WRAPPER_DECL(char *, nl_langinfo, nl_item)
++UNINIT_WRAPPER_DECL(size_t, mbstowcs, wchar_t *restrict, const char *restrict, size_t)
+diff --git a/main.c b/main.c
+index 12bb541..1671e29 100644
+--- a/main.c
++++ b/main.c
+@@ -1,74 +1,108 @@
++#include <stdint.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+ #include <time.h>
+ #include <unistd.h>
+ #include <sys/wait.h>
++#include <assert.h>
+ 
+-void print_stats(struct timespec tv0)
+-{
+-	FILE *f;
+-	char buf[256];
+-	struct timespec tv;
+-	int maj, min, in_heap=0;
+-	unsigned long l;
+-	size_t vm_size=0, vm_rss=0, vm_priv_dirty=0;
+-
+-	clock_gettime(CLOCK_REALTIME, &tv);
+-	tv.tv_sec -= tv0.tv_sec;
+-	if ((tv.tv_nsec -= tv0.tv_nsec) < 0) {
+-		tv.tv_nsec += 1000000000;
+-		tv.tv_sec--;
+-	}
+-
+-	f = fopen("/proc/self/smaps", "rb");
+-	if (f) while (fgets(buf, sizeof buf, f)) {
+-		if (sscanf(buf, "%*lx-%*lx %*s %*lx %x:%x %*lu %*s", &maj, &min)==2)
+-			in_heap = (!maj && !min && !strstr(buf, "---p") && (strstr(buf, "[heap]") || !strchr(buf, '[')));
+-		if (in_heap) {
+-			if (sscanf(buf, "Size: %lu", &l)==1) vm_size += l;
+-			else if (sscanf(buf, "Rss: %lu", &l)==1) vm_rss += l;
+-			else if (sscanf(buf, "Private_Dirty: %lu", &l)==1) vm_priv_dirty += l;
+-		}
+-	}
+-	if (f) fclose(f);
+-	printf("  time: %ld.%.9ld, virt: %zu, res: %zu, dirty: %zu\n\n",
+-		(long)tv.tv_sec, (long)tv.tv_nsec,
+-		vm_size, vm_rss, vm_priv_dirty);
+-}
++// void print_stats(struct timespec tv0)
++// {
++// 	FILE *f;
++// 	char buf[256];
++// 	struct timespec tv;
++// 	int maj, min, in_heap=0;
++// 	unsigned long l;
++// 	size_t vm_size=0, vm_rss=0, vm_priv_dirty=0;
++
++// 	clock_gettime(CLOCK_REALTIME, &tv);
++// 	tv.tv_sec -= tv0.tv_sec;
++// 	if ((tv.tv_nsec -= tv0.tv_nsec) < 0) {
++// 		tv.tv_nsec += 1000000000;
++// 		tv.tv_sec--;
++// 	}
++
++// 	f = fopen("/proc/self/smaps", "rb");
++// 	if (f) while (fgets(buf, sizeof buf, f)) {
++// 		if (sscanf(buf, "%*lx-%*lx %*s %*lx %x:%x %*lu %*s", &maj, &min)==2)
++// 			in_heap = (!maj && !min && !strstr(buf, "---p") && (strstr(buf, "[heap]") || !strchr(buf, '[')));
++// 		if (in_heap) {
++// 			if (sscanf(buf, "Size: %lu", &l)==1) vm_size += l;
++// 			else if (sscanf(buf, "Rss: %lu", &l)==1) vm_rss += l;
++// 			else if (sscanf(buf, "Private_Dirty: %lu", &l)==1) vm_priv_dirty += l;
++// 		}
++// 	}
++// 	if (f) fclose(f);
++// 	printf("  time: %ld.%.9ld, virt: %zu, res: %zu, dirty: %zu\n\n",
++// 		(long)tv.tv_sec, (long)tv.tv_nsec,
++// 		vm_size, vm_rss, vm_priv_dirty);
++// }
+ 
+ int run_bench(const char *label, size_t (*bench)(void *), void *params)
+ {
+-	struct timespec tv0;
+-	pid_t p = fork();
+-	if (p) {
+-		int status;
+-		wait(&status);
+-		return status;
+-	}
++	// struct timespec tv0;
++	// pid_t p = fork();
++	// if (p) {
++	// 	int status;
++	// 	wait(&status);
++	// 	return status;
++	// }
+ 
+ 	puts(label);
+-	clock_gettime(CLOCK_REALTIME, &tv0);
++	// clock_gettime(CLOCK_REALTIME, &tv0);
+ 	bench(params);
+-	print_stats(tv0);
+-	exit(0);
++	// print_stats(tv0);
++	// exit(0);
++	return 0;
++}
++
++#ifdef INSTRUMENT_UNINIT
++uint64_t _uninit_call_count = 0;
++uint64_t previous_call_count = 0;
++uint64_t previous_instret = 0;
++void print_instr()
++{
++	uint64_t current_instret;
++	asm volatile ("csrr %0, minstret" : "=r" (current_instret));
++	printf("Instrumentation since previous benchmark:\n\tInstructions: %ld\n", current_instret - previous_instret);
++	previous_instret = current_instret;
++	printf("\tNumber of secure calls: %ld\n", _uninit_call_count - previous_call_count);
++	previous_call_count = _uninit_call_count;
+ }
+ 
++void write_stats(FILE* stats_out)
++{
++	fprintf(stats_out, "secureCalls    %ld    "
++		"# Amount of secure calls made during the benchmark\n",
++		_uninit_call_count);
++}
+ #define RUN(a, b) \
+ 	extern size_t (a)(void *); \
+-	run_bench(#a " (" #b ")", (a), (b))
++	run_bench(#a " (" #b ")", (a), (b)); \
++	print_instr()
++#else
++#define RUN(a, b) \
++	extern size_t (a)(void *); \
++	run_bench(#a " (" #b ")", (a), (b));
++#endif /* INSTRUMENT_UNINIT */
+ 
+-int main()
+-{
++#define RUN_PART_IF_SELECTED(name, arg) \
++  if (strcmp(arg, #name) == 0) \
++    run_##name();
++
++void run_malloc(){
+ 	RUN(b_malloc_sparse, 0);
+ 	RUN(b_malloc_bubble, 0);
+ 	RUN(b_malloc_tiny1, 0);
+ 	RUN(b_malloc_tiny2, 0);
+ 	RUN(b_malloc_big1, 0);
+ 	RUN(b_malloc_big2, 0);
+-	RUN(b_malloc_thread_stress, 0);
+-	RUN(b_malloc_thread_local, 0);
++	// RUN(b_malloc_thread_stress, 0);
++	// RUN(b_malloc_thread_local, 0);
++}
+ 
++void run_string(){
+ 	RUN(b_string_strstr, "abcdefghijklmnopqrstuvwxyz");
+ 	RUN(b_string_strstr, "azbycxdwevfugthsirjqkplomn");
+ 	RUN(b_string_strstr, "aaaaaaaaaaaaaacccccccccccc");
+@@ -77,22 +111,53 @@ int main()
+ 	RUN(b_string_memset, 0);
+ 	RUN(b_string_strchr, 0);
+ 	RUN(b_string_strlen, 0);
++}
+ 
+-	RUN(b_pthread_createjoin_serial1, 0);
+-	RUN(b_pthread_createjoin_serial2, 0);
+-	RUN(b_pthread_create_serial1, 0);
+-	RUN(b_pthread_uselesslock, 0);
+-	RUN(b_pthread_createjoin_minimal1, 0);
+-	RUN(b_pthread_createjoin_minimal2, 0);
++// void run_pthread(){
++// 	RUN(b_pthread_createjoin_serial1, 0);
++// 	RUN(b_pthread_createjoin_serial2, 0);
++// 	RUN(b_pthread_create_serial1, 0);
++// 	RUN(b_pthread_uselesslock, 0);
++// }
+ 
++void run_utf8(){
+ 	RUN(b_utf8_bigbuf, 0);
+ 	RUN(b_utf8_onebyone, 0);
++}
+ 
++void run_stdio(){
+ 	RUN(b_stdio_putcgetc, 0);
+ 	RUN(b_stdio_putcgetc_unlocked, 0);
++}
+ 
++void run_regex(){
+ 	RUN(b_regex_compile, "(a|b|c)*d*b");
+ 	RUN(b_regex_search, "(a|b|c)*d*b");
+ 	RUN(b_regex_search, "a{25}b");
+ }
+ 
++int main(int argc, char* argv[])
++{
++	assert(argc >= 2 && "Too little args!");
++	char *benchmark_part = argv[1];
++
++#ifdef INSTRUMENT_UNINIT
++	assert(argc >= 3 && "No instrumentation file specified!");
++	FILE *stats_out = fopen(argv[2], "w");
++#endif /* INSTRUMENT_UNINIT */
++	
++	RUN_PART_IF_SELECTED(malloc, benchmark_part)
++	RUN_PART_IF_SELECTED(string, benchmark_part)
++	RUN_PART_IF_SELECTED(utf8, benchmark_part)
++	RUN_PART_IF_SELECTED(stdio, benchmark_part)
++	RUN_PART_IF_SELECTED(regex, benchmark_part)
++
++#ifdef INSTRUMENT_UNINIT
++	write_stats(stats_out);
++	fclose(stats_out);
++#endif /* INSTRUMENT_UNINIT */
++
++	puts("libc-bench execution complete");
++	return 0;
++}
++
+diff --git a/malloc.c b/malloc.c
+index 79cc88b..4e3e7a4 100644
+--- a/malloc.c
++++ b/malloc.c
+@@ -1,154 +1,206 @@
++#include "libc_wrappers.h"
++#include <stddef.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+ #include <pthread.h>
++#include <stdbool.h>
++
++#define ARRAY_SIZE 1000
++#define ALLOC_SIZE 4096
++
++typedef struct mbs {
++  void **p;
++  bool *a;
++} malloc_bench_struct;
++
++#define INIT_MB_STRUCT void **_p = calloc(ARRAY_SIZE, sizeof(void *));\
++	bool *_a = calloc(ARRAY_SIZE, sizeof(bool));\
++	malloc_bench_struct s = {_p, _a};
++#define RELEASE_MB_STRUCT free(_p); free(_a);
++
++void __attribute__((always_inline)) inline bench_malloc(malloc_bench_struct *s, size_t size, size_t off)
++{
++	s->a[off] = true;
++	s->p[off] = MAYBE_UNINIT_WRAPPER(malloc)(size);
++}
++
++void __attribute__((always_inline)) inline bench_free(malloc_bench_struct *s, size_t off)
++{
++	MAYBE_UNINIT_WRAPPER(free)(s->p[off]);
++	s->a[off] = false;
++}
++
++void __attribute__((always_inline)) inline malloc_recover_memory(malloc_bench_struct *s, size_t array_size)
++{
++	for (size_t i=0; i < array_size; i++)
++		if (s->a[i]) 
++			MAYBE_UNINIT_WRAPPER(free)(s->p[i]);
++}
+ 
+ size_t b_malloc_sparse(void *dummy)
+ {
+-	void *p[10000];
++	INIT_MB_STRUCT
+ 	size_t i;
+-	for (i=0; i<sizeof p/sizeof *p; i++) {
+-		p[i] = malloc(4000);
+-		memset(p[i], 0, 4000);
++	for (i=0; i<ARRAY_SIZE; i++) {
++		bench_malloc(&s, ALLOC_SIZE, i);
++		MAYBE_UNINIT_WRAPPER(memset)(s.p[i], 0, ALLOC_SIZE);
+ 	}
+-	for (i=0; i<sizeof p/sizeof *p; i++)
+-		if (i%150) free(p[i]);
++	for (i=0; i<ARRAY_SIZE; i++)
++		if (i%150) bench_free(&s, i);
++	malloc_recover_memory(&s, ARRAY_SIZE);
++	RELEASE_MB_STRUCT
+ 	return 0;
+ }
+ 
+ size_t b_malloc_bubble(void *dummy)
+ {
+-	void *p[10000];
++	INIT_MB_STRUCT
+ 	size_t i;
+-	for (i=0; i<sizeof p/sizeof *p; i++) {
+-		p[i] = malloc(4000);
+-		memset(p[i], 0, 4000);
++	for (i=0; i<ARRAY_SIZE; i++) {
++		bench_malloc(&s, ALLOC_SIZE, i);
++		MAYBE_UNINIT_WRAPPER(memset)(s.p[i], 0, ALLOC_SIZE);
+ 	}
+-	for (i=0; i<sizeof p/sizeof *p-1; i++)
+-		free(p[i]);
++	for (i=0; i<ARRAY_SIZE-1; i++)
++		bench_free(&s, i);
++	malloc_recover_memory(&s, ARRAY_SIZE);
++	RELEASE_MB_STRUCT
+ 	return 0;
+ }
+ 
+ size_t b_malloc_tiny1(void *dummy)
+ {
+-	void *p[10000];
++	INIT_MB_STRUCT
+ 	size_t i;
+-	for (i=0; i<sizeof p/sizeof *p; i++) {
+-		p[i] = malloc((i%4+1)*16);
+-	}
+-	for (i=0; i<sizeof p/sizeof *p; i++) {
+-		free(p[i]);
++	for (i=0; i<ARRAY_SIZE; i++) {
++		bench_malloc(&s, (i%4+1)*16, i);
+ 	}
++	for (i=0; i<ARRAY_SIZE; i++)
++		bench_free(&s, i);
++	malloc_recover_memory(&s, ARRAY_SIZE);
++	RELEASE_MB_STRUCT
+ 	return 0;
+ }
+ 
+ size_t b_malloc_tiny2(void *dummy)
+ {
+-	void *p[10000];
++	INIT_MB_STRUCT
+ 	size_t i;
+-	for (i=0; i<sizeof p/sizeof *p; i++) {
+-		p[i] = malloc((i%4+1)*16);
++	for (i=0; i<ARRAY_SIZE; i++) {
++		bench_malloc(&s, (i%4+1)*16, i);
+ 	}
+-	for (i=1; i; i = (i+57)%(sizeof p/sizeof *p))
+-		free(p[i]);
++	for (i=1; i; i = (i+57)%(ARRAY_SIZE))
++		bench_free(&s, i);
++	malloc_recover_memory(&s, ARRAY_SIZE);
++	RELEASE_MB_STRUCT
+ 	return 0;
+ }
+ 
++#define BIG_ARRAY_SIZE 2000
++#define BIG_ALLOC_SIZE 16384
++
++#define INIT_BIG_MB_STRUCT void **_p = calloc(BIG_ARRAY_SIZE, sizeof(void *));\
++	bool *_a = calloc(BIG_ARRAY_SIZE, sizeof(bool));\
++	malloc_bench_struct s = {_p, _a};
+ size_t b_malloc_big1(void *dummy)
+ {
+-	void *p[2000];
++	INIT_BIG_MB_STRUCT
+ 	size_t i;
+-	for (i=0; i<sizeof p/sizeof *p; i++) {
+-		p[i] = malloc((i%4+1)*16384);
++	for (i=0; i<BIG_ARRAY_SIZE; i++) {
++		bench_malloc(&s, (i%4+1)*BIG_ALLOC_SIZE, i);
+ 	}
+-	for (i=0; i<sizeof p/sizeof *p; i++) {
+-		free(p[i]);
++	for (i=0; i<BIG_ARRAY_SIZE; i++) {
++		bench_free(&s, i);
+ 	}
++	malloc_recover_memory(&s, BIG_ARRAY_SIZE);
++	RELEASE_MB_STRUCT
+ 	return 0;
+ }
+ 
+ size_t b_malloc_big2(void *dummy)
+ {
+-	void *p[2000];
++	INIT_BIG_MB_STRUCT
+ 	size_t i;
+-	for (i=0; i<sizeof p/sizeof *p; i++) {
+-		p[i] = malloc((i%4+1)*16384);
+-	}
+-	for (i=1; i; i = (i+57)%(sizeof p/sizeof *p))
+-		free(p[i]);
+-	return 0;
+-}
+-
+-
+-#define LOOPS 100000
+-#define SH_COUNT 300
+-#define PV_COUNT 300
+-#define MAX_SZ 500
+-#define DEF_SZ 40
+-
+-struct foo {
+-	pthread_mutex_t lock;
+-	void *mem;
+-};
+-
+-static unsigned rng(unsigned *r)
+-{
+-	return *r = *r * 1103515245 + 12345;
+-}
+-
+-
+-static void *stress(void *arg)
+-{
+-	struct foo *foo = arg;
+-	unsigned r = (unsigned)pthread_self();
+-	int i, j;
+-	size_t sz;
+-	void *p;
+-
+-	for (i=0; i<LOOPS; i++) {
+-		j = rng(&r) % SH_COUNT;
+-		sz = rng(&r) % MAX_SZ;
+-		pthread_mutex_lock(&foo[j].lock);
+-		p = foo[j].mem;
+-		foo[j].mem = 0;
+-		pthread_mutex_unlock(&foo[j].lock);
+-		free(p);
+-		if (!p) {
+-			p = malloc(sz);
+-			pthread_mutex_lock(&foo[j].lock);
+-			if (!foo[j].mem) foo[j].mem = p, p = 0;
+-			pthread_mutex_unlock(&foo[j].lock);
+-			free(p);
+-		}
++	for (i=0; i<BIG_ARRAY_SIZE; i++) {
++		bench_malloc(&s, (i%4+1)*BIG_ALLOC_SIZE, i);
+ 	}
++	for (i=1; i; i = (i+57)%BIG_ARRAY_SIZE)
++		bench_free(&s, i);
++	malloc_recover_memory(&s, BIG_ARRAY_SIZE);
++	RELEASE_MB_STRUCT
+ 	return 0;
+ }
+ 
+-size_t b_malloc_thread_stress(void *dummy)
+-{
+-	struct foo foo[SH_COUNT] = {0};
+-	pthread_t td1, td2;
+-	void *res;
+-	int i;
+-
+-	pthread_create(&td1, 0, stress, foo);
+-	pthread_create(&td2, 0, stress, foo);
+-	pthread_join(td1, &res);
+-	pthread_join(td2, &res);
+-	return 0;
+-}
+ 
+-size_t b_malloc_thread_local(void *dummy)
+-{
+-	struct foo foo1[SH_COUNT] = {0};
+-	struct foo foo2[SH_COUNT] = {0};
+-	pthread_t td1, td2;
+-	void *res;
+-	int i;
+-
+-	pthread_create(&td1, 0, stress, foo1);
+-	pthread_create(&td2, 0, stress, foo2);
+-	pthread_join(td1, &res);
+-	pthread_join(td2, &res);
+-	return 0;
+-}
++// #define LOOPS 100000
++// #define SH_COUNT 300
++// #define PV_COUNT 300
++// #define MAX_SZ 500
++// #define DEF_SZ 40
++
++// struct foo {
++// 	pthread_mutex_t lock;
++// 	void *mem;
++// };
++
++// static unsigned rng(unsigned *r)
++// {
++// 	return *r = *r * 1103515245 + 12345;
++// }
++
++
++// static void *stress(void *arg)
++// {
++// 	struct foo *foo = arg;
++// 	unsigned r = (unsigned)pthread_self();
++// 	int i, j;
++// 	size_t sz;
++// 	void *p;
++
++// 	for (i=0; i<LOOPS; i++) {
++// 		j = rng(&r) % SH_COUNT;
++// 		sz = rng(&r) % MAX_SZ;
++// 		pthread_mutex_lock(&foo[j].lock);
++// 		p = foo[j].mem;
++// 		foo[j].mem = 0;
++// 		pthread_mutex_unlock(&foo[j].lock);
++// 		free(p);
++// 		if (!p) {
++// 			p = malloc(sz);
++// 			pthread_mutex_lock(&foo[j].lock);
++// 			if (!foo[j].mem) foo[j].mem = p, p = 0;
++// 			pthread_mutex_unlock(&foo[j].lock);
++// 			free(p);
++// 		}
++// 	}
++// 	return 0;
++// }
++
++// size_t b_malloc_thread_stress(void *dummy)
++// {
++// 	struct foo foo[SH_COUNT] = {0};
++// 	pthread_t td1, td2;
++// 	void *res;
++// 	int i;
++
++// 	pthread_create(&td1, 0, stress, foo);
++// 	pthread_create(&td2, 0, stress, foo);
++// 	pthread_join(td1, &res);
++// 	pthread_join(td2, &res);
++// 	return 0;
++// }
++
++// size_t b_malloc_thread_local(void *dummy)
++// {
++// 	struct foo foo1[SH_COUNT] = {0};
++// 	struct foo foo2[SH_COUNT] = {0};
++// 	pthread_t td1, td2;
++// 	void *res;
++// 	int i;
++
++// 	pthread_create(&td1, 0, stress, foo1);
++// 	pthread_create(&td2, 0, stress, foo2);
++// 	pthread_join(td1, &res);
++// 	pthread_join(td2, &res);
++// 	return 0;
++// }
+diff --git a/regex.c b/regex.c
+index 46cfe37..1f30bcc 100644
+--- a/regex.c
++++ b/regex.c
+@@ -1,30 +1,34 @@
++#include "libc_wrappers.h"
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+ #include <regex.h>
+ #include <locale.h>
+ 
++#define REGEX_COMP_ITERATIONS 10
++
+ size_t b_regex_compile(void *s)
+ {
+ 	regex_t re;
+ 	size_t i;
+-	setlocale(LC_CTYPE, "");
+-	for (i=0; i<1000; i++) {
+-		regcomp(&re, s, REG_EXTENDED);
+-		regfree(&re);
++	MAYBE_UNINIT_WRAPPER(setlocale)(LC_CTYPE, "");
++	for (i=0; i<REGEX_COMP_ITERATIONS; i++) {
++		MAYBE_UNINIT_WRAPPER(regcomp)(&re, s, REG_EXTENDED);
++		MAYBE_UNINIT_WRAPPER(regfree)(&re);
+ 	}
+ }
+ 
+ size_t b_regex_search(void *s)
+ {
+-	char buf[260000];
++	// char buf[260000];
++	char *buf = (char*) MAYBE_UNINIT_WRAPPER(malloc)(260000);
+ 	regex_t re;
+ 	size_t i;
+-	setlocale(LC_CTYPE, "");
+-	memset(buf, 'a', sizeof(buf)-2);
++	MAYBE_UNINIT_WRAPPER(setlocale)(LC_CTYPE, "");
++	MAYBE_UNINIT_WRAPPER(memset)(buf, 'a', sizeof(buf)-2);
+ 	buf[sizeof buf - 2] = 'b';
+ 	buf[sizeof buf - 1] = 0;
+-	regcomp(&re, s, REG_EXTENDED);
+-	regexec(&re, buf, 0, 0, 0);
+-	regfree(&re);
++	MAYBE_UNINIT_WRAPPER(regcomp)(&re, s, REG_EXTENDED);
++	MAYBE_UNINIT_WRAPPER(regexec)(&re, buf, 0, 0, 0);
++	MAYBE_UNINIT_WRAPPER(regfree)(&re);
+ }
+diff --git a/stdio.c b/stdio.c
+index 0d41f86..0e489d2 100644
+--- a/stdio.c
++++ b/stdio.c
+@@ -1,18 +1,21 @@
++#include "libc_wrappers.h"
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+ 
++#define ITERATIONS 10000
++
+ size_t b_stdio_putcgetc(void *dummy)
+ {
+-	FILE *f = tmpfile();
++	FILE *f = MAYBE_UNINIT_WRAPPER(tmpfile)();
+ 	size_t i;
+ 	size_t cs;
+ 
+-	for (i=0; i<5000000; i++)
+-		putc('x', f);
+-	fseeko(f, 0, SEEK_SET);
+-	for (i=0; i<5000000; i++)
+-		cs += getc(f);
++	for (i=0; i<ITERATIONS; i++)
++		MAYBE_UNINIT_WRAPPER(putc)('x', f);
++	MAYBE_UNINIT_WRAPPER(fseeko)(f, 0, SEEK_SET);
++	for (i=0; i<ITERATIONS; i++)
++		cs += MAYBE_UNINIT_WRAPPER(getc)(f);
+ 	fclose(f);
+ 
+ 	return cs;
+@@ -20,15 +23,15 @@ size_t b_stdio_putcgetc(void *dummy)
+ 
+ size_t b_stdio_putcgetc_unlocked(void *dummy)
+ {
+-	FILE *f = tmpfile();
++	FILE *f = MAYBE_UNINIT_WRAPPER(tmpfile)();
+ 	size_t i;
+ 	size_t cs;
+ 
+-	for (i=0; i<5000000; i++)
+-		putc_unlocked('x', f);
+-	fseeko(f, 0, SEEK_SET);
+-	for (i=0; i<5000000; i++)
+-		cs += getc_unlocked(f);
++	for (i=0; i<ITERATIONS; i++)
++		MAYBE_UNINIT_WRAPPER(putc_unlocked)('x', f);
++	MAYBE_UNINIT_WRAPPER(fseeko)(f, 0, SEEK_SET);
++	for (i=0; i<ITERATIONS; i++)
++		cs += MAYBE_UNINIT_WRAPPER(getc_unlocked)(f);
+ 	fclose(f);
+ 
+ 	return cs;
+diff --git a/string.c b/string.c
+index 158b828..3e0a350 100644
+--- a/string.c
++++ b/string.c
+@@ -1,68 +1,73 @@
++#include "libc_wrappers.h"
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+ 
+-#define BUFLEN 500000
++#define HAYSTACK_SIZE 25
++#define BUFLEN 2500
++#define STRING_ITERATIONS 100
++#define STRING_MEMSET_ITERATIONS 2*STRING_ITERATIONS
++#define STRING_STRCHR_ITERATIONS STRING_ITERATIONS
++#define STRING_STRLEN_ITERATIONS 2*STRING_ITERATIONS
+ 
+ size_t b_string_strstr(void *dummy)
+ {
+ 	const char *needle = dummy;
+-	size_t l = strlen(needle);
++	size_t l = MAYBE_UNINIT_WRAPPER(strlen)(needle);
+ 	size_t i;
+-	size_t cnt = 10000;
+ 	size_t cs = 0;
+-	char *haystack = malloc(l * cnt + 1);
+-	for (i=0; i<cnt-1; i++) {
+-		memcpy(haystack + l*i, needle, l);
++	char *haystack = MAYBE_UNINIT_WRAPPER(malloc)(l * HAYSTACK_SIZE + 1);
++	for (i=0; i<HAYSTACK_SIZE-1; i++) {
++		MAYBE_UNINIT_WRAPPER(memcpy)(haystack + l*i, needle, l);
+ 		haystack[l*i+l-1] ^= 1;
+ 	}
+-	memcpy(haystack + l*i, needle, l+1);
++	MAYBE_UNINIT_WRAPPER(memcpy)(haystack + l*i, needle, l+1);
+ 	for (i=0; i<50; i++) {
+ 		haystack[0]^=1;
+-		cs += (int)strstr(haystack, needle);
++		cs += (int)MAYBE_UNINIT_WRAPPER(strstr)(haystack, needle);
+ 	}
+-	free(haystack);
++	MAYBE_UNINIT_WRAPPER(free)(haystack);
+ 	return cs;
+ }
+ 
+ size_t b_string_memset(void *dummy)
+ {
+-	char *buf = malloc(BUFLEN);
++	char *buf = MAYBE_UNINIT_WRAPPER(malloc)(BUFLEN);
+ 	size_t i;
+-	for (i=0; i<100; i++)
+-		memset(buf+i, i, BUFLEN-i);
+-	free(buf);
++	for (i=0; i<STRING_MEMSET_ITERATIONS; i++)
++		MAYBE_UNINIT_WRAPPER(memset)(buf+i, i, BUFLEN-i);
++	MAYBE_UNINIT_WRAPPER(free)(buf);
+ 	return 0;
+ }
+ 
+ size_t b_string_strchr(void *dummy)
+ {
+-	char *buf = malloc(BUFLEN);
++	char *buf = MAYBE_UNINIT_WRAPPER(malloc)(BUFLEN);
+ 	size_t i;
+ 	size_t cs;
+-	memset(buf, 'a', BUFLEN);
++	MAYBE_UNINIT_WRAPPER(memset)(buf, 'a', BUFLEN);
+ 	buf[BUFLEN-1] = 0;
+ 	buf[BUFLEN-2] = 'b';
+-	for (i=0; i<100; i++) {
++	for (i=0; i<STRING_STRCHR_ITERATIONS; i++) {
+ 		buf[i] = '0'+i%8;
+-		cs += (int)strchr(buf, 'b');
++		cs += (int)MAYBE_UNINIT_WRAPPER(strchr)(buf, 'b');
+ 	}
+-	free(buf);
++	MAYBE_UNINIT_WRAPPER(free)(buf);
+ 	return cs;
+ }
+ 
+ size_t b_string_strlen(void *dummy)
+ {
+-	char *buf = malloc(BUFLEN);
++	char *buf = MAYBE_UNINIT_WRAPPER(malloc)(BUFLEN);
+ 	size_t i;
+ 	size_t cs = 0;
+ 
+-	memset(buf, 'a', BUFLEN-1);
++	MAYBE_UNINIT_WRAPPER(memset)(buf, 'a', BUFLEN-1);
+ 	buf[BUFLEN-1] = 0;
+-	for (i=0; i<100; i++) {
++	for (i=0; i<STRING_STRLEN_ITERATIONS; i++) {
+ 		buf[i] = '0'+i%8;
+-		cs += strlen(buf);
++		cs += MAYBE_UNINIT_WRAPPER(strlen)(buf);
+ 	}
+-	free(buf);
++	MAYBE_UNINIT_WRAPPER(free)(buf);
+ 	return cs;
+ }
+diff --git a/utf8.c b/utf8.c
+index 5a675ed..7c8bfe5 100644
+--- a/utf8.c
++++ b/utf8.c
+@@ -1,3 +1,4 @@
++#include "libc_wrappers.h"
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+@@ -20,8 +21,8 @@ size_t b_utf8_bigbuf(void *dummy)
+ 	|| setlocale(LC_CTYPE, "fr_FR-8");
+ 	if (strcmp(nl_langinfo(CODESET), "UTF-8")) return -1;
+ 
+-	buf = malloc(500000);
+-	wbuf = malloc(500000*sizeof(wchar_t));
++	buf = MAYBE_UNINIT_WRAPPER(malloc)(500000);
++	wbuf = MAYBE_UNINIT_WRAPPER(malloc)(500000*sizeof(wchar_t));
+ 	l = 0;
+ 	for (i=0xc3; i<0xe0; i++)
+ 		for (j=0x80; j<0xc0; j++)
+@@ -36,9 +37,9 @@ size_t b_utf8_bigbuf(void *dummy)
+ 				buf[l++] = i, buf[l++] = j, buf[l++] = 0x80, buf[l++] = k;
+ 	buf[l++] = 0;
+ 	for (i=0; i<50; i++)
+-		cs += mbstowcs(wbuf, buf, 500000);
+-	free(wbuf);
+-	free(buf);
++		cs += MAYBE_UNINIT_WRAPPER(mbstowcs)(wbuf, buf, 500000);
++	MAYBE_UNINIT_WRAPPER(free)(wbuf);
++	MAYBE_UNINIT_WRAPPER(free)(buf);
+ 	return cs;
+ }
+ 
