@@ -31,6 +31,11 @@ Patches from the `patches` folder can be applied onto the repo at the given URL,
 
 ## Usage
 
+### Using the Dockerfile
+
+Install Docker, then build the image using `docker build -t littlecheri .`.
+Finally, spin up a container with `docker run --rm -it littlecheri`, and skip to "Building and running the benchmarks".
+
 ### Configuring the environment locally
 
 Clone the repositories listed under patches (keep in mind sail-riscv is a submodule of sail-cheri-riscv, but has its own patch).
@@ -44,6 +49,7 @@ Configure the paths to their sources in `benchmark-runner/config/local_config.ya
 ### Building and running the benchmarks
 
 We use the `snakemake` tool as a build script for building and running benchmarks.
+Before using it, activate its conda environment with `conda activate snakemake`.
 The folder `benchmark-runner/runs/2026-04-23_12-38-05` contains the results as published in the paper, as well as the seed used to run the `random-callstack-ubench`.
 Change directory into the `benchmark-runner` folder and run `snakemake --cores $(nproc) runs/2026-04-23_12-38-05/results.csv --force` to re-run those results.
 
